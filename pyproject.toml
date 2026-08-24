@@ -1,0 +1,49 @@
+[project]
+name = "tualpha"
+version = "0.5.0"
+description = "Event-driven daily backtesting for China A-share stocks and ETFs"
+readme = "README.md"
+keywords = ["backtest", "quant", "a-share", "etf", "tushare"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+authors = [
+    { name = "joshuaxql", email = "qiuleiustc@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "bcolz-zipline==1.13.0",
+    "duckdb>=1.4",
+    "filelock>=3.16",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "plotly>=5.24",
+    "tushare>=1.4",
+    "zipline-reloaded==3.1.1",
+]
+
+[project.scripts]
+tualpha = "tualpha.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"

@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Test and tool caches
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# Local backtest outputs
+outputs/
+
+# Pi Agent
+.pi/*
