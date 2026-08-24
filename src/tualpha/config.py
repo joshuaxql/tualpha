@@ -61,6 +61,7 @@ class BacktestConfig:
     benchmark: str | None = None
     strategy_name: str = "TuAlpha 回测策略"
     generate_report: bool = True
+    show_progress: bool = True
     plotly_js: PlotlyJsMode | str = PlotlyJsMode.INLINE
     annualization_factor: int = 252
     bundle_name: str = "tualpha"

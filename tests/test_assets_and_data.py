@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import duckdb
@@ -7,6 +9,7 @@ import pandas as pd
 import pytest
 
 from tualpha.assets import AssetFinder, Board
+from tualpha.bundle import latest_bundle_path
 from tualpha.calendar import ChinaTradingCalendar
 from tualpha.data import BarData, TushareDataPortal
 from tualpha.exceptions import DataError
@@ -105,6 +108,71 @@ def test_financial_queries_are_announcement_point_in_time(data_root: Path) -> No
     portal.close()
 
 
+def test_index_constituents_are_strictly_point_in_time(data_root: Path) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+
+    before_visible = portal.index_constituents("000300.SH", "2024-01-02")
+    assert before_visible.empty
+    assert list(before_visible.columns) == ["asset", "weight", "snapshot_date"]
+
+    initial = portal.index_constituents("000300.SH", "2024-01-03")
+    assert list(initial.index) == ["000001.SZ", "688001.SH"]
+    assert initial["weight"].tolist() == [60.0, 40.0]
+    assert initial.loc["000001.SZ", "asset"] == finder.retrieve_asset("000001.SZ")
+    assert initial.attrs["snapshot_date"] == pd.Timestamp("2024-01-02")
+
+    same_day = portal.index_constituents("000300.SH", "2024-01-04")
+    assert list(same_day.index) == ["000001.SZ", "688001.SH"]
+    next_day = portal.index_constituents("000300.SH", "2024-01-05")
+    assert list(next_day.index) == ["688001.SH"]
+    assert next_day.iloc[0]["weight"] == 100.0
+    assert next_day.attrs["snapshot_date"] == pd.Timestamp("2024-01-04")
+
+    initial.loc["000001.SZ", "weight"] = 0.0
+    assert (
+        portal.index_constituents("000300.SH", "2024-01-03").loc["000001.SZ", "weight"]
+        == 60.0
+    )
+
+    data = BarData(portal)
+    data._set_session("2024-01-05")
+    assert list(data.index_constituents("000300.SH").index) == ["688001.SH"]
+    with pytest.raises(KeyError, match="unavailable"):
+        data.index_constituents("MISSING.INDEX")
+    with pytest.raises(DataError, match="cannot exceed backtest end"):
+        portal.index_constituents("000300.SH", "2024-01-09")
+    portal.close()
+
+
+def test_schema_v4_bundle_still_supports_non_constituent_reads(
+    data_root: Path, tmp_path: Path
+) -> None:
+    legacy_root = tmp_path / "legacy"
+    legacy_path = legacy_root / "bundles" / "tualpha"
+    shutil.copytree(latest_bundle_path(data_root), legacy_path)
+    (legacy_path / "index_constituents.sqlite").unlink()
+    manifest_path = legacy_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 4
+    for key in list(manifest):
+        if key.startswith("index_constituent"):
+            del manifest[key]
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    finder = AssetFinder(legacy_root)
+    calendar = ChinaTradingCalendar(legacy_root)
+    stock = finder.retrieve_asset("000001.SZ")
+    portal = TushareDataPortal(legacy_root, finder, calendar, "raw", "2024-01-08")
+    assert portal.value(stock, "2024-01-02", "close") == 10.0
+    with pytest.raises(DataError, match="does not contain PIT index constituents"):
+        portal.index_constituents("000300.SH", "2024-01-03")
+    portal.close()
+
+
 def test_portal_rejects_mixed_bundle_generations(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)
@@ -126,6 +194,7 @@ def test_runtime_does_not_open_duckdb(
     portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
     assert portal.value(stock, "2024-01-02", "daily_basic.pe") == 10.0
     assert portal.fundamental(stock, "2024-01-03", "income.revenue") == 100.0
+    assert len(portal.index_constituents("000300.SH", "2024-01-03")) == 2
     portal.close()
 
 

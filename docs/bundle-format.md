@@ -1,6 +1,6 @@
 # TuAlpha Bundle 文件格式
 
-本文描述 TuAlpha 0.5、Bundle schema v4 的固定目录格式。CSV 目录与 Bundle 根目录必须分离，默认发布位置为：
+本文描述 TuAlpha 0.6、Bundle schema v5 的固定目录格式。CSV 目录与 Bundle 根目录必须分离，默认发布位置为：
 
 ```text
 ~/.tualpha/bundles/tualpha/
@@ -25,11 +25,12 @@ bundles/tualpha/
 ├── minute_equities.bcolz/
 ├── adjustments.sqlite
 ├── finance.sqlite
+├── index_constituents.sqlite
 ├── manifest.json
 └── READY
 ```
 
-schema v4 **不生成、不读取 `tualpha.duckdb`**。`normalized.duckdb` 仅位于 Bundle 外部的 `cache/`，是可重建的构建缓存，不是回测数据源。
+schema v5 **不生成、不读取 `tualpha.duckdb`**。`normalized.duckdb` 仅位于 Bundle 外部的 `cache/`，是可重建的构建缓存，不是回测数据源。
 
 ## 2. `assets-7.sqlite`
 
@@ -104,7 +105,7 @@ stock_st.is_st              → ta_stock_st__is_st
 
 DataPortal 自动解码，策略看到的仍是中文字符串。字典编码避免在 1600 万行上重复保存定长 Unicode，并保持 Bcolz 列式压缩效率。
 
-根属性 `tualpha_schema_version=4` 表示扩展布局版本。构建器会验证每个扩展列与标准 CTable 等长。
+根属性 `tualpha_schema_version=5` 表示扩展布局版本。构建器会验证每个扩展列与标准 CTable 等长。
 
 ## 4. `index_daily.bcolz/`
 
@@ -119,7 +120,31 @@ DataPortal 自动解码，策略看到的仍是中文字符串。字典编码避
 
 根属性 `first_row`、`last_row` 定位指数块；`manifest.json` 的 `benchmark_sids` 保存指数代码到 sid 的映射。`benchmark_returns()` 直接读取该文件，不允许策略下单指数。
 
-## 5. `finance.sqlite`
+## 5. `index_constituents.sqlite`
+
+标准 SQLite 数据库，保存月度指数成分权重快照。表 `index_constituents` 包含：
+
+| 字段 | 含义 |
+|---|---|
+| `index_code` | 指数 Tushare 代码。 |
+| `snapshot_date` | 权重快照日期，ISO `YYYY-MM-DD`。 |
+| `con_code` | 成分证券 Tushare 代码。 |
+| `sid` | 可映射时保存稳定资产 ID，否则为空。 |
+| `weight` | Tushare 原始百分比权重，通常合计约 100。 |
+
+主键为 `(index_code, snapshot_date, con_code)`，并建立按指数快照和成分代码查询的索引。`index_constituent_metadata` 保存 schema、Bundle generation、权重单位以及 PIT 规则。
+
+策略通过 `data.index_constituents(index_code)` 查询。为采用保守可见时点，SQL 只选择：
+
+```text
+max(snapshot_date) where snapshot_date < 当前回测日
+```
+
+因此 D 日快照从 D+1 回调开始可见；首个快照前返回空集，两个快照之间沿用最近历史快照。Tushare 没有公告时间或历史修订时间，因此不能还原供应商后续修订前的数据版本。
+
+默认维护 `000300.SH`、`000852.SH`、`000905.SH`、`000906.SH` 和 `899050.BJ`，其他代码可通过 `tualpha update --index-weight CODE` 追加。
+
+## 6. `finance.sqlite`
 
 标准 SQLite 数据库，保存四张公告时点财务宽表：
 
@@ -162,7 +187,7 @@ end_date <= 当前回测日
 
 `finance_metadata` 保存 schema 版本和 PIT 规则。发布前执行 `PRAGMA integrity_check`。
 
-## 6. 其他官方文件
+## 7. 其他官方文件
 
 ### `minute_equities.bcolz/`
 
@@ -178,11 +203,11 @@ ratio = 前一交易日复权因子 / 当前复权因子
 
 `dividends`、`dividend_payouts`、`stock_dividend_payouts` 和 `splits` 当前为空。只有复权因子时，账户层采用“分红再投”经济近似，不等同于真实现金分红到账。
 
-## 7. `manifest.json` 与 `READY`
+## 8. `manifest.json` 与 `READY`
 
 `manifest.json` 主要字段：
 
-- `schema_version=4`
+- `schema_version=5`
 - `bundle_name`、`generated_at`
 - `start_session`、`end_session`
 - `asset_count`
@@ -190,6 +215,8 @@ ratio = 前一交易日复权因子 / 当前复权因子
 - `settlement_days=1`
 - `daily_extensions=daily_equities.bcolz`
 - `index_prices=index_daily.bcolz`
+- `index_constituents=index_constituents.sqlite`
+- `index_constituent_codes`、快照/行数、日期范围、权重单位和 PIT 规则
 - `finance=finance.sqlite`
 - `benchmark_sids`
 
@@ -202,9 +229,10 @@ ratio = 前一交易日复权因子 / 当前复权因子
 - 全部日线扩展列等长且字段注册表完整；
 - 指数 Bcolz 列等长；
 - `finance.sqlite` 完整性及 schema 正确；
+- `index_constituents.sqlite` 完整性、generation、PIT 规则、权重范围和 manifest 计数正确；
 - Zipline 官方 Readers 能打开资产、日线、分钟和调整文件。
 
-## 8. Bundle 外构建缓存
+## 9. Bundle 外构建缓存
 
 ### `cache/tualpha/normalized.duckdb`
 
@@ -219,12 +247,12 @@ ratio = 前一交易日复权因子 / 当前复权因子
 ### `.locks/` 与 `.staging/`
 
 - `.locks/` 防止并行构建和发布；Reader 生命周期内持有同一把锁；
-- `.staging/` 先完整生成 schema v4，验证后再原子替换固定 Bundle；
+- `.staging/` 先完整生成 schema v5，验证后再原子替换固定 Bundle；
 - Windows 上现有 Bcolz/SQLite Reader 关闭前，更新会等待而不是强行重命名打开的文件。
 
 旧 schema 不原地修改，必须从 CSV/normalized cache 在 staging 中重建后整体切换。
 
-## 9. 数据流
+## 10. 数据流
 
 ```text
 显式 CSV 目录
@@ -234,14 +262,16 @@ cache/tualpha/normalized.duckdb       # 仅构建缓存
     │
     ├── Zipline Writers ───────────────┐
     ├── Bcolz extension writer ────────┤
-    └── finance SQLite writer ─────────┤
+    ├── finance SQLite writer ─────────┤
+    └── constituent SQLite writer ─────┤
                                        ▼
 bundles/tualpha/
     ├── assets-7.sqlite
     ├── daily_equities.bcolz   # OHLCV + 扩展日线列
     ├── index_daily.bcolz
     ├── adjustments.sqlite
-    └── finance.sqlite
+    ├── finance.sqlite
+    └── index_constituents.sqlite
              │
              ▼
          回测引擎

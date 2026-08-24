@@ -118,7 +118,7 @@ class DailyBar:
 
 
 class BundleDataPortal:
-    """Read OHLCV and daily extensions from Bcolz and finance from SQLite."""
+    """Read bars and point-in-time datasets from an immutable Bundle."""
 
     def __init__(
         self,
@@ -154,10 +154,17 @@ class BundleDataPortal:
             daily_path = self.bundle_path / "daily_equities.bcolz"
             index_path = self.bundle_path / "index_daily.bcolz"
             finance_path = self.bundle_path / "finance.sqlite"
+            constituent_name = manifest.get("index_constituents")
+            constituent_path = (
+                self.bundle_path / str(constituent_name)
+                if constituent_name is not None
+                else None
+            )
             if (
                 not daily_path.is_dir()
                 or not index_path.is_dir()
                 or not finance_path.is_file()
+                or (constituent_path is not None and not constituent_path.is_file())
             ):
                 raise DataError(f"bundle is incomplete: {self.bundle_path}")
             self._daily_table = bcolz.open(rootdir=str(daily_path), mode="r")
@@ -168,11 +175,37 @@ class BundleDataPortal:
             self._finance = sqlite3.connect(finance_uri, uri=True)
             self._finance.execute("PRAGMA query_only = ON")
             self._financial_columns = self._load_financial_columns()
+            self._index_constituents: sqlite3.Connection | None = None
+            if constituent_path is not None:
+                constituent_uri = (
+                    f"file:{constituent_path.resolve().as_posix()}?mode=ro&immutable=1"
+                )
+                self._index_constituents = sqlite3.connect(constituent_uri, uri=True)
+                self._index_constituents.execute("PRAGMA query_only = ON")
+                metadata = dict(
+                    self._index_constituents.execute(
+                        "SELECT key, value FROM index_constituent_metadata"
+                    )
+                )
+                if (
+                    metadata.get("generated_at") != generation
+                    or metadata.get("point_in_time_rule") != "snapshot_date < session"
+                ):
+                    raise DataError(
+                        "index constituent data comes from a different generation"
+                    )
+            self._index_constituent_codes = tuple(
+                str(code).upper()
+                for code in manifest.get("index_constituent_codes", [])
+            )
             self._benchmark_sids = {
                 str(code).upper(): int(sid)
                 for code, sid in manifest.get("benchmark_sids", {}).items()
             }
         except Exception:
+            if getattr(self, "_index_constituents", None) is not None:
+                self._index_constituents.close()
+                self._index_constituents = None
             if getattr(self, "_finance", None) is not None:
                 self._finance.close()
                 self._finance = None
@@ -248,6 +281,9 @@ class BundleDataPortal:
         return tuple(sorted(fields))
 
     def close(self) -> None:
+        if getattr(self, "_index_constituents", None) is not None:
+            self._index_constituents.close()
+            self._index_constituents = None
         if getattr(self, "_finance", None) is not None:
             self._finance.close()
             self._finance = None
@@ -699,6 +735,93 @@ class BundleDataPortal:
         result = result.loc[~result.index.duplicated(keep="first")].head(periods)
         return result.reindex(columns=field_names)
 
+    @lru_cache(maxsize=32_768)  # noqa: B019 - cache lifetime equals this portal
+    def _index_constituent_rows(
+        self, index_code: str, session_text: str
+    ) -> tuple[tuple[str, int | None, float, str], ...]:
+        if self._index_constituents is None:
+            raise DataError(
+                "Bundle does not contain PIT index constituents; "
+                "run `tualpha update` to rebuild it"
+            )
+        code = index_code.upper().strip()
+        if code not in self._index_constituent_codes:
+            raise KeyError(f"index constituents are unavailable for {code!r}")
+        return tuple(
+            (
+                str(con_code),
+                int(sid) if sid is not None else None,
+                float(weight),
+                str(snapshot_date),
+            )
+            for con_code, sid, weight, snapshot_date in self._index_constituents.execute(
+                """
+                SELECT con_code, sid, weight, snapshot_date
+                FROM index_constituents
+                WHERE index_code = ?
+                  AND snapshot_date = (
+                      SELECT max(snapshot_date)
+                      FROM index_constituents
+                      WHERE index_code = ? AND snapshot_date < ?
+                  )
+                ORDER BY con_code
+                """,
+                [code, code, session_text],
+            )
+        )
+
+    def index_constituents(
+        self,
+        index_code: str,
+        session: str | pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Return the latest index snapshot strictly before ``session``.
+
+        Weights retain Tushare's percentage unit and rows are indexed by
+        constituent ``ts_code``. A new DataFrame is returned on every call so
+        strategy code cannot mutate the portal cache.
+        """
+
+        date = normalize_session(session)
+        if date > self.backtest_end:
+            raise DataError("index constituent query cannot exceed backtest end")
+        rows = self._index_constituent_rows(
+            index_code.upper().strip(), date.strftime("%Y-%m-%d")
+        )
+        result_rows = []
+        for con_code, sid, weight, snapshot_date in rows:
+            asset = None
+            if sid is not None:
+                try:
+                    asset = self.asset_finder.retrieve_asset(sid)
+                except LookupError:
+                    pass
+            result_rows.append(
+                {
+                    "ts_code": con_code,
+                    "asset": asset,
+                    "weight": weight,
+                    "snapshot_date": pd.Timestamp(snapshot_date),
+                }
+            )
+        if not result_rows:
+            empty = pd.DataFrame(
+                {
+                    "asset": pd.Series(dtype=object),
+                    "weight": pd.Series(dtype=float),
+                    "snapshot_date": pd.Series(dtype="datetime64[ns]"),
+                },
+                index=pd.Index([], name="ts_code"),
+            )
+            empty.attrs["index_code"] = index_code.upper().strip()
+            return empty
+        frame = pd.DataFrame(result_rows).set_index("ts_code")
+        frame.index.name = "ts_code"
+        frame.attrs["index_code"] = index_code.upper().strip()
+        frame.attrs["snapshot_date"] = frame["snapshot_date"].iloc[0]
+        frame.attrs["weight_unit"] = "percent"
+        return frame[["asset", "weight", "snapshot_date"]]
+
     def benchmark_returns(self, code: str, sessions: pd.DatetimeIndex) -> pd.Series:
         try:
             asset = self.asset_finder.retrieve_asset(code)
@@ -742,6 +865,7 @@ class BundleDataPortal:
         self._metadata_row.cache_clear()
         self._factor_series.cache_clear()
         self.factor.cache_clear()
+        self._index_constituent_rows.cache_clear()
 
 
 # Backward-compatible internal name; all reads now come from the bundle.
@@ -872,6 +996,11 @@ class BarData:
             periods=periods,
             report_type=report_type,
         )
+
+    def index_constituents(self, index_code: str) -> pd.DataFrame:
+        """Return the latest index constituents visible before this session."""
+
+        return self._portal.index_constituents(index_code, self.current_session)
 
     def available_fields(self, namespace: str | None = None) -> tuple[str, ...]:
         return self._portal.available_fields(namespace)

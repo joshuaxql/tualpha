@@ -2,7 +2,7 @@
 
 TuAlpha 是基于tushare数据面向中国 A 股股票与 ETF 的日频事件驱动回测框架。框架借鉴 Zipline 的 `Asset → DataPortal → Blotter → Ledger → Metrics` 分层，使用 **zipline-reloaded 官方 Bundle 格式**和中国市场交易规则。
 
-> 当前版本为 `0.5.0`，只支持多头现金账户、股票和 ETF；不支持期货、期权、融资融券或 ETF 申赎。
+> 当前版本为 `0.6.0`，只支持多头现金账户、股票和 ETF；不支持期货、期权、融资融券或 ETF 申赎。
 
 ## 功能
 
@@ -17,6 +17,7 @@ TuAlpha 是基于tushare数据面向中国 A 股股票与 ETF 的日频事件驱
 - **所有股票和 ETF 统一 T+1**
 - 股票印花税、佣金、经手费与过户费；避免 all-in 佣金重复计费
 - 前复权、后复权或不复权策略数据
+- 五个默认宽基指数的 PIT 历史成分与权重
 - 中文 Plotly HTML 报告和每日持仓 CSV
 - `tualpha update` 增量更新显式指定的 Tushare CSV 缓存并替换固定目录 Bundle
 
@@ -49,6 +50,7 @@ Bundle 与原始 CSV 已完全分离。Bundle 根目录默认是 `~/.tualpha`，
 │       ├── minute_equities.bcolz/
 │       ├── adjustments.sqlite
 │       ├── finance.sqlite           # 公告时点财务宽表
+│       ├── index_constituents.sqlite # PIT 指数成分与权重
 │       ├── manifest.json
 │       └── READY
 ├── cache/
@@ -60,7 +62,7 @@ Bundle 与原始 CSV 已完全分离。Bundle 根目录默认是 `~/.tualpha`，
 └── .staging/                        # 构建临时区；成功后自动清理
 ```
 
-Bundle schema v4 不再生成或读取 `tualpha.duckdb`。`normalized.duckdb` 只存在于 `cache/`，用于更新和构建，不属于可发布 Bundle。旧 schema 必须通过 `tualpha update` 或 `build_bundle()` 整体重建；发布成功后旧目录（含旧数据库）会被原子替换。
+Bundle schema v5 不生成或读取 `tualpha.duckdb`。`normalized.duckdb` 只存在于 `cache/`，用于更新和构建，不属于可发布 Bundle。旧 schema 必须通过 `tualpha update` 或 `build_bundle()` 整体重建；发布成功后旧目录（含旧数据库）会被原子替换。
 
 CSV 缓存目录**没有默认值**，执行更新时必须显式传入，并且不能与 Bundle 根目录互为父子目录。例如：
 
@@ -77,6 +79,7 @@ E:\data\tushare_data\
 ├── industry\YYYYMMDD.csv
 ├── stock_st\YYYYMMDD.csv
 ├── index_daily\YYYYMMDD.csv
+├── index_weight\YYYYMMDD.csv
 ├── balancesheet\YYYYMMDD.csv
 ├── income\YYYYMMDD.csv
 ├── cashflow\YYYYMMDD.csv
@@ -106,7 +109,7 @@ tualpha update --csv-dir /e/data/tushare_data
 tualpha update --csv-dir /e/data/tushare_data --from 20260101 --to 20260821
 tualpha update --csv-dir /e/data/tushare_data --repair-from 20250101
 tualpha update --csv-dir /e/data/tushare_data --lookback 20
-tualpha update --csv-dir /e/data/tushare_data --index-weight 000300.SH
+tualpha update --csv-dir /e/data/tushare_data --index-weight 000016.SH
 tualpha update --csv-dir /e/data/tushare_data --bundle-root /d/tualpha-bundle
 tualpha update --csv-dir /e/data/tushare_data --dry-run --json
 ```
@@ -120,7 +123,7 @@ tualpha update --csv-dir /e/data/tushare_data --dry-run --json
 5. 在临时目录生成新的 Bundle，加载验证成功后替换固定的 `~/.tualpha/bundles/tualpha`。
 6. 原子写入 `~/.tualpha/update-status.json`，记录 `running / succeeded / failed / dry_run_succeeded` 状态、CSV 路径、更新时间、更新日期和错误信息。
 
-`index_weight` 官方接口要求逐个指数代码查询。命令默认更新本地已经跟踪过的指数；首次使用可通过多个 `--index-weight` 指定代码。
+`index_weight` 官方接口要求逐个指数代码查询。TuAlpha 默认维护 `000300.SH`、`000852.SH`、`000905.SH`、`000906.SH` 和 `899050.BJ`；首次更新从本地最早日线之前一个月开始回补，之后重抓最近两个快照月。重复传入 `--index-weight` 可追加其他指数。原始权重单位为百分比。
 
 ## 快速开始
 
@@ -154,10 +157,13 @@ result = run_algorithm(
     benchmark="000300.SH",
     output_dir="outputs/demo",
     strategy_name="沪深300 ETF 趋势策略",
+    show_progress=True,  # 默认使用 tqdm 显示交易日进度
 )
 
 print(result.summary())
 ```
+
+回测默认使用 `tqdm` 显示已处理交易日、完成比例、运行速度、预计剩余时间和当前日期。批处理、测试或嵌套运行时可传入 `show_progress=False` 关闭。
 
 运行后生成：
 
@@ -167,7 +173,7 @@ outputs/demo/
 └── daily_positions.csv
 ```
 
-`daily_positions.csv` 使用 UTF-8-SIG 和长表结构。每个交易日都有一条 `CASH` 记录，持仓记录包含数量、可卖数量、成本、原始/复权收盘价、市值、权重和未实现盈亏。
+`daily_positions.csv` 使用 UTF-8-SIG 和长表结构。每个交易日都有一条 `CASH` 记录，持仓记录包含数量、可卖数量、成本、原始/复权收盘价、市值、权重和未实现盈亏。HTML 报告的组合归因表按标的展示成交次数、持有总天数、已实现盈亏、贡献占比和总费用；持有总天数按日终持仓大于零的交易日去重统计。
 
 ## 核心 API
 
@@ -186,6 +192,7 @@ outputs/demo/
 - `data.history(asset, field, bar_count)`
 - `data.fundamental(asset, field, period="latest")`
 - `data.fundamentals(asset, fields, periods=4)`
+- `data.index_constituents(index_code)`
 - `data.available_fields(namespace=None)`
 - `data.can_trade(asset)`
 
@@ -210,6 +217,18 @@ is_st = data.current(context.asset, "stock_st.is_st")
 - `stock_st`：ST 名称、类型及虚拟字段 `is_st`，非 ST 日返回 `0`。
 
 可通过 `data.available_fields("daily_basic")` 查看当前 Bundle 实际包含的字段。所有扩展日线字段都是 `daily_equities.bcolz` 的物理 CTable 列，例如 `ta_daily_basic__pe_ttm`；行业和 ST 字符串采用字典编码列，并由根属性中的字段注册表透明还原。回测不会读取 CSV 或 `normalized.duckdb`。
+
+## PIT 历史指数成分与权重
+
+```python
+members = data.index_constituents("000300.SH")
+# 索引：ts_code
+# 列：asset、weight、snapshot_date
+```
+
+查询返回当前回调日前最新的月度快照，`weight` 保持 Tushare 百分比口径。为避免把快照日收盘后才能确定的数据提前使用，规则严格为 `snapshot_date < 当前回测日`：D 日快照从 D+1 首个回调开始可见；首个可见快照前返回空 DataFrame，快照之间沿用最近历史快照，绝不反向填充未来成分。无法映射到资产库的成分仍保留代码和权重，`asset` 为 `None`。
+
+正式数据位于 Bundle 的 `index_constituents.sqlite`。Tushare 未提供公告时间和历史修订时间，因此该能力保证“快照日期 PIT”，不能还原供应商后续修订前的数据版本。
 
 ## 无未来函数的财务查询
 

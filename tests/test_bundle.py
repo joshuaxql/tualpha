@@ -40,14 +40,25 @@ def test_builds_fixed_official_bundle_with_bcolz_extensions(
     assert (result.path / "minute_equities.bcolz" / "metadata.json").is_file()
     assert (result.path / "adjustments.sqlite").is_file()
     assert (result.path / "finance.sqlite").is_file()
+    assert (result.path / "index_constituents.sqlite").is_file()
     assert not (result.path / "tualpha.duckdb").exists()
     assert (result.path / "READY").is_file()
 
     manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["settlement_days"] == 1
     assert manifest["volume_multiplier"] == 100.0
     assert manifest["finance"] == "finance.sqlite"
+    assert manifest["index_constituents"] == "index_constituents.sqlite"
+    assert manifest["index_constituent_rows"] == 19
+    assert manifest["index_constituent_snapshots"] == 10
+    assert manifest["index_constituent_codes"] == [
+        "000300.SH",
+        "000852.SH",
+        "000905.SH",
+        "000906.SH",
+        "899050.BJ",
+    ]
     assert "000985.CSI" in manifest["benchmark_sids"]
 
     daily = bcolz.open(rootdir=str(result.path / "daily_equities.bcolz"), mode="r")
@@ -89,6 +100,25 @@ def test_builds_fixed_official_bundle_with_bcolz_extensions(
         )
     finally:
         finance.close()
+
+    constituents = sqlite3.connect(result.path / "index_constituents.sqlite")
+    try:
+        assert constituents.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert (
+            constituents.execute("SELECT count(*) FROM index_constituents").fetchone()[
+                0
+            ]
+            == 19
+        )
+        assert (
+            constituents.execute(
+                "SELECT value FROM index_constituent_metadata "
+                "WHERE key = 'generated_at'"
+            ).fetchone()[0]
+            == manifest["generated_at"]
+        )
+    finally:
+        constituents.close()
 
     loaded = load_bundle_data(bundle_root)
     try:

@@ -129,6 +129,10 @@ if is_st == 1:
     ...
 ```
 
+## 指数成分与权重
+
+`data.index_constituents(index_code)` 返回月度指数快照，`weight` 单位是百分比而非 0～1 小数。D 日快照严格从 D+1 可见；它不属于 `current()` / `history()` 字段，也不能用于指数下单。
+
 ## 财务数据
 
 财务字段只能通过 `fundamental()` / `fundamentals()` 读取。

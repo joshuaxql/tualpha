@@ -36,7 +36,7 @@ from .exceptions import DataError
 from .tushare_fields import FINANCIAL_FIELDS
 
 BUNDLE_NAME = "tualpha"
-BUNDLE_SCHEMA_VERSION = 4
+BUNDLE_SCHEMA_VERSION = 5
 NORMALIZED_STORE_SCHEMA_VERSION = 2
 UPDATE_STATUS_SCHEMA_VERSION = 2
 SID_MAP_VERSION = 1
@@ -1553,6 +1553,136 @@ def _write_finance(
         sqlite.close()
 
 
+def _write_index_constituents(
+    csv_dir: Path,
+    output_dir: Path,
+    records: Sequence[BundleAssetRecord],
+    end_session: pd.Timestamp,
+    generated_at: str,
+) -> dict[str, Any]:
+    destination = output_dir / "index_constituents.sqlite"
+    destination.unlink(missing_ok=True)
+    connection = sqlite3.connect(destination)
+    try:
+        connection.execute("PRAGMA journal_mode = OFF")
+        connection.execute("PRAGMA synchronous = OFF")
+        connection.execute(
+            """
+            CREATE TABLE index_constituents(
+                index_code TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                con_code TEXT NOT NULL,
+                sid INTEGER,
+                weight REAL NOT NULL,
+                PRIMARY KEY(index_code, snapshot_date, con_code)
+            ) WITHOUT ROWID
+            """
+        )
+        sid_by_code = {record.ts_code: record.sid for record in records}
+        maximum_date = end_session.strftime("%Y%m%d")
+        source = csv_dir / "index_weight"
+        for path in sorted(source.glob("*.csv")) if source.is_dir() else ():
+            try:
+                frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+            except pd.errors.EmptyDataError:
+                continue
+            columns = ("index_code", "con_code", "trade_date", "weight")
+            missing = set(columns).difference(frame.columns)
+            if missing:
+                raise DataError(
+                    f"index weight CSV is missing columns {sorted(missing)}: {path}"
+                )
+            frame = frame[list(columns)].copy()
+            frame["index_code"] = frame["index_code"].str.upper()
+            frame["con_code"] = frame["con_code"].str.upper()
+            frame["trade_date"] = frame["trade_date"].astype(str)
+            frame = frame[frame["trade_date"] <= maximum_date]
+            if frame.empty:
+                continue
+            dates = pd.to_datetime(
+                frame["trade_date"], format="%Y%m%d", errors="coerce"
+            )
+            weights = pd.to_numeric(frame["weight"], errors="coerce")
+            invalid = (
+                dates.isna()
+                | weights.isna()
+                | ~weights.between(0.0, 100.0)
+                | frame["index_code"].eq("")
+                | frame["con_code"].eq("")
+            )
+            if invalid.any():
+                raise DataError(f"index weight CSV contains invalid rows: {path}")
+            rows = [
+                (
+                    str(index_code),
+                    snapshot_date.strftime("%Y-%m-%d"),
+                    str(con_code),
+                    sid_by_code.get(str(con_code)),
+                    float(weight),
+                )
+                for index_code, con_code, snapshot_date, weight in zip(
+                    frame["index_code"],
+                    frame["con_code"],
+                    dates,
+                    weights,
+                    strict=True,
+                )
+            ]
+            connection.executemany(
+                "INSERT OR REPLACE INTO index_constituents VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+        connection.execute(
+            "CREATE INDEX index_constituents_snapshot "
+            "ON index_constituents(index_code, snapshot_date)"
+        )
+        connection.execute(
+            "CREATE INDEX index_constituents_member "
+            "ON index_constituents(con_code, snapshot_date)"
+        )
+        connection.execute(
+            "CREATE TABLE index_constituent_metadata"
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO index_constituent_metadata VALUES (?, ?)",
+            {
+                "schema_version": str(BUNDLE_SCHEMA_VERSION),
+                "generated_at": generated_at,
+                "point_in_time_rule": "snapshot_date < session",
+                "weight_unit": "percent",
+            }.items(),
+        )
+        connection.commit()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity != ("ok",):
+            raise DataError(
+                f"index_constituents.sqlite integrity check failed: {integrity}"
+            )
+        row = connection.execute(
+            """
+            SELECT count(*), count(DISTINCT index_code || ':' || snapshot_date),
+                   min(snapshot_date), max(snapshot_date)
+            FROM index_constituents
+            """
+        ).fetchone()
+        codes = [
+            str(item[0])
+            for item in connection.execute(
+                "SELECT DISTINCT index_code FROM index_constituents ORDER BY index_code"
+            )
+        ]
+    finally:
+        connection.close()
+    return {
+        "codes": codes,
+        "rows": int(row[0]),
+        "snapshots": int(row[1]),
+        "start": row[2],
+        "end": row[3],
+    }
+
+
 def _write_manifest(
     output_dir: Path,
     records: Sequence[BundleAssetRecord],
@@ -1560,12 +1690,14 @@ def _write_manifest(
     start_session: pd.Timestamp,
     end_session: pd.Timestamp,
     bundle_name: str,
+    generated_at: str,
+    index_constituents: dict[str, Any],
 ) -> None:
     manifest = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "bundle_name": bundle_name,
         "layout": "fixed",
-        "generated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "generated_at": generated_at,
         "start_session": start_session.strftime("%Y-%m-%d"),
         "end_session": end_session.strftime("%Y-%m-%d"),
         "asset_count": len(records),
@@ -1575,6 +1707,14 @@ def _write_manifest(
         "settlement_days": 1,
         "daily_extensions": "daily_equities.bcolz",
         "index_prices": "index_daily.bcolz",
+        "index_constituents": "index_constituents.sqlite",
+        "index_constituent_codes": index_constituents["codes"],
+        "index_constituent_rows": index_constituents["rows"],
+        "index_constituent_snapshots": index_constituents["snapshots"],
+        "index_constituent_start": index_constituents["start"],
+        "index_constituent_end": index_constituents["end"],
+        "index_constituent_weight_unit": "percent",
+        "index_constituent_point_in_time": "snapshot_date < session",
         "finance": "finance.sqlite",
         "benchmark_sids": {record.ts_code: record.sid for record in benchmark_records},
     }
@@ -1590,11 +1730,16 @@ REQUIRED_BUNDLE_ENTRIES = (
     "minute_equities.bcolz",
     "adjustments.sqlite",
     "finance.sqlite",
+    "index_constituents.sqlite",
     "manifest.json",
 )
 
 
 def _validate_tualpha_files(path: Path) -> None:
+    manifest_path = path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if int(manifest.get("schema_version", -1)) != BUNDLE_SCHEMA_VERSION:
+        raise DataError("Bundle manifest schema version is invalid")
     legacy = path / "tualpha.duckdb"
     if legacy.exists():
         raise DataError(f"legacy Bundle sidecar must not exist: {legacy}")
@@ -1634,6 +1779,54 @@ def _validate_tualpha_files(path: Path) -> None:
         raise DataError(f"finance.sqlite integrity check failed: {integrity}")
     if metadata.get("schema_version") != str(BUNDLE_SCHEMA_VERSION):
         raise DataError("finance.sqlite schema version is invalid")
+
+    constituents_path = path / "index_constituents.sqlite"
+    if not constituents_path.is_file():
+        raise DataError("index constituent SQLite is missing")
+    constituents = sqlite3.connect(constituents_path)
+    try:
+        constituent_integrity = constituents.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()
+        constituent_metadata = dict(
+            constituents.execute("SELECT key, value FROM index_constituent_metadata")
+        )
+        invalid_rows = constituents.execute(
+            "SELECT count(*) FROM index_constituents "
+            "WHERE weight < 0 OR weight > 100 OR snapshot_date > ?",
+            [str(manifest["end_session"])],
+        ).fetchone()[0]
+        codes = [
+            str(row[0])
+            for row in constituents.execute(
+                "SELECT DISTINCT index_code FROM index_constituents ORDER BY index_code"
+            )
+        ]
+        row = constituents.execute(
+            "SELECT count(*), "
+            "count(DISTINCT index_code || ':' || snapshot_date) "
+            "FROM index_constituents"
+        ).fetchone()
+    finally:
+        constituents.close()
+    if constituent_integrity != ("ok",):
+        raise DataError(
+            f"index_constituents.sqlite integrity check failed: {constituent_integrity}"
+        )
+    if constituent_metadata.get("schema_version") != str(BUNDLE_SCHEMA_VERSION):
+        raise DataError("index constituent SQLite schema version is invalid")
+    if constituent_metadata.get("generated_at") != str(manifest["generated_at"]):
+        raise DataError("index constituent SQLite generation is invalid")
+    if constituent_metadata.get("point_in_time_rule") != "snapshot_date < session":
+        raise DataError("index constituent point-in-time rule is invalid")
+    if invalid_rows:
+        raise DataError("index constituent rows are invalid")
+    if codes != list(manifest.get("index_constituent_codes", [])):
+        raise DataError("index constituent code manifest is inconsistent")
+    if int(row[0]) != int(manifest.get("index_constituent_rows", -1)) or int(
+        row[1]
+    ) != int(manifest.get("index_constituent_snapshots", -1)):
+        raise DataError("index constituent counts are inconsistent")
 
 
 def _write_bundle_files(
@@ -1696,6 +1889,14 @@ def _write_bundle_files(
         records,
     )
     _write_finance(normalized_path, csv_dir, output_dir, records)
+    generated_at = datetime.now(ZoneInfo("UTC")).isoformat()
+    index_constituents = _write_index_constituents(
+        csv_dir,
+        output_dir,
+        records,
+        end_session,
+        generated_at,
+    )
     _write_manifest(
         output_dir,
         records,
@@ -1703,6 +1904,8 @@ def _write_bundle_files(
         start_session,
         end_session,
         bundle_name,
+        generated_at,
+        index_constituents,
     )
 
 

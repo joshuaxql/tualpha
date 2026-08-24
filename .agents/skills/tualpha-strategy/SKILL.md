@@ -1,7 +1,7 @@
 ---
 name: tualpha-strategy
-description: 为 TuAlpha 框架设计、编写、修改、调试和审查 A 股或 ETF 日频回测策略。用户提到 TuAlpha、使用本仓库写策略、事件驱动回测、选股/择时/轮动、估值资金流行业ST或公告时点财务因子时使用。生成的策略必须遵守 D 日决策、D+1 成交、T+1、涨跌停和无未来函数约束。
-compatibility: TuAlpha >= 0.5.0, Python >= 3.12, uv
+description: 为 TuAlpha 框架设计、编写、修改、调试和审查 A 股或 ETF 日频回测策略。用户提到 TuAlpha、使用本仓库写策略、事件驱动回测、选股/择时/轮动、估值资金流行业ST、PIT指数成分或公告时点财务因子时使用。生成的策略必须遵守 D 日决策、D+1 成交、T+1、涨跌停和无未来函数约束。
+compatibility: TuAlpha >= 0.6.0, Python >= 3.12, uv
 metadata:
   version: "1.0.0"
 ---
@@ -82,6 +82,7 @@ if __name__ == "__main__":
 - 价格：`data.current()`、`data.history()`；
 - 不复权价格仅在确有需要时使用 `data.raw_current()`；
 - 日频扩展字段：`daily_basic.*`、`moneyflow.*`、`industry.*`、`stock_st.*`；
+- PIT 指数成分：`data.index_constituents(index_code)`，D 日快照从 D+1 可见；
 - 财务字段：只能用 `data.fundamental()` 或 `data.fundamentals()`；
 - 不确定字段时先调用 `data.available_fields(namespace)`；
 - 数值信号先检查 `pd.notna()` / `np.isfinite()`；
@@ -150,6 +151,7 @@ run_algorithm(
     execution_time="open",
     benchmark="000300.SH",
     generate_report=True,
+    show_progress=True,
     output_dir="outputs/<strategy_name>",
 )
 ```
@@ -158,6 +160,7 @@ run_algorithm(
 - 成交、费用和涨跌停判断始终使用原始价格；
 - 需要严格原始价格信号时才选择 `raw`；
 - `plotly_js="inline"` 生成完全离线报告；
+- 默认使用 `tqdm` 显示交易日回测进度，批处理或测试可设 `show_progress=False`；
 - 指定 `output_dir` 后会输出 `report.html` 和 `daily_positions.csv`。
 
 ## 验证

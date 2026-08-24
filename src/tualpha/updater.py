@@ -33,6 +33,14 @@ from .exceptions import ConfigurationError, DataError
 from .tushare_fields import FINANCIAL_FIELDS
 
 UPDATE_SCHEMA_VERSION = 2
+INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION = 1
+DEFAULT_INDEX_WEIGHT_CODES = (
+    "000300.SH",
+    "000852.SH",
+    "000905.SH",
+    "000906.SH",
+    "899050.BJ",
+)
 DAILY_KEY_COLUMNS = ("ts_code", "trade_date")
 
 
@@ -117,6 +125,15 @@ class UpdateOptions:
             raise ConfigurationError("retries must be at least 1")
         if self.backoff < 0:
             raise ConfigurationError("backoff must be non-negative")
+        self.index_weight_codes = tuple(
+            dict.fromkeys(
+                code.strip().upper() for code in self.index_weight_codes if code.strip()
+            )
+        )
+        if any("." not in code for code in self.index_weight_codes):
+            raise ConfigurationError(
+                "index weight codes must include an exchange suffix"
+            )
         for value in (self.start, self.end, self.repair_from):
             if value is not None:
                 pd.to_datetime(value, format="%Y%m%d")
@@ -578,52 +595,264 @@ class DataUpdater:
                 publications.append((staged, destination))
         return publications, journal
 
-    def _download_index_weights(
-        self, staging: Path, safe_end: str
-    ) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
-        codes = set(self.options.index_weight_codes)
+    def _index_weight_history_start(self, dates: Sequence[str], safe_end: str) -> str:
+        candidates = [str(date) for date in dates]
+        for directory in ("daily", "fund_daily", "index_daily"):
+            candidates.extend(
+                path.stem
+                for path in (self.options.csv_dir / directory).glob("*.csv")
+                if len(path.stem) == 8 and path.stem.isdigit()
+            )
+        earliest = min(candidates) if candidates else safe_end
+        return (
+            (pd.to_datetime(earliest, format="%Y%m%d") - pd.DateOffset(months=1))
+            .replace(day=1)
+            .strftime("%Y%m%d")
+        )
+
+    def _load_index_weight_coverage(self) -> dict[str, Any]:
+        path = self.options.csv_dir / "index_weight" / "_coverage.json"
+        if not path.is_file():
+            return {
+                "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
+                "codes": {},
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise DataError(f"invalid index weight coverage file: {path}") from exc
+        if payload.get(
+            "schema_version"
+        ) != INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION or not isinstance(
+            payload.get("codes"), dict
+        ):
+            raise DataError(f"unsupported index weight coverage file: {path}")
+        return payload
+
+    def _existing_index_weight_dates(self) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {}
         for path in (self.options.csv_dir / "index_weight").glob("*.csv"):
             try:
-                frame = pd.read_csv(path, usecols=["index_code"], dtype=str)
+                frame = pd.read_csv(
+                    path,
+                    usecols=["index_code", "trade_date"],
+                    dtype=str,
+                    keep_default_na=False,
+                )
             except (ValueError, pd.errors.EmptyDataError):
                 continue
-            codes.update(frame["index_code"].dropna().astype(str))
-        if not codes:
-            return [], []
-        end = pd.Timestamp(safe_end)
-        start = end.replace(day=1).strftime("%Y%m%d")
-        frames = [
-            self._fetch_paginated(
-                "index_weight",
-                {"index_code": code, "start_date": start, "end_date": safe_end},
-                5000,
+            for code, values in frame.groupby("index_code")["trade_date"]:
+                result.setdefault(str(code).upper(), set()).update(values.astype(str))
+        return result
+
+    @staticmethod
+    def _normalize_index_weight_frame(
+        frame: pd.DataFrame, code: str, start: str, end: str
+    ) -> pd.DataFrame:
+        columns = ("index_code", "con_code", "trade_date", "weight")
+        missing = set(columns).difference(frame.columns)
+        if missing:
+            raise DataError(f"index_weight returned missing columns: {sorted(missing)}")
+        result = frame[list(columns)].copy()
+        result["index_code"] = result["index_code"].astype(str).str.upper()
+        result["con_code"] = result["con_code"].astype(str).str.upper()
+        result["trade_date"] = result["trade_date"].astype(str)
+        returned_codes = set(result["index_code"])
+        if returned_codes != {code}:
+            raise DataError(
+                f"index_weight for {code} returned unexpected codes: "
+                f"{sorted(returned_codes)}"
             )
-            for code in sorted(codes)
+        if not result["trade_date"].between(start, end).all():
+            raise DataError(f"index_weight for {code} returned dates outside request")
+        weights = pd.to_numeric(result["weight"], errors="coerce")
+        if weights.isna().any() or not weights.between(0.0, 100.0).all():
+            raise DataError(f"index_weight for {code} returned invalid weights")
+        result["weight"] = weights.astype(float)
+        return DataUpdater._normalize_frame(
+            result,
+            ["index_code", "con_code", "trade_date"],
+        )
+
+    @staticmethod
+    def _index_weight_ranges(start: str, end: str) -> list[tuple[str, str]]:
+        first = pd.to_datetime(start, format="%Y%m%d")
+        last = pd.to_datetime(end, format="%Y%m%d")
+        return [
+            (
+                max(first, pd.Timestamp(year=year, month=1, day=1)).strftime("%Y%m%d"),
+                min(last, pd.Timestamp(year=year, month=12, day=31)).strftime("%Y%m%d"),
+            )
+            for year in range(first.year, last.year + 1)
         ]
-        combined = pd.concat(frames, ignore_index=True, sort=False)
-        if combined.empty:
-            return [], []
-        publications = []
-        journal = []
+
+    def _download_index_weights(
+        self,
+        staging: Path,
+        safe_end: str,
+        dates: Sequence[str],
+    ) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
+        existing_dates = self._existing_index_weight_dates()
+        codes = {
+            *DEFAULT_INDEX_WEIGHT_CODES,
+            *(code.upper() for code in self.options.index_weight_codes),
+            *existing_dates,
+        }
+        history_start = self._index_weight_history_start(dates, safe_end)
+        coverage = self._load_index_weight_coverage()
+        coverage_codes = coverage["codes"]
+        fetched: list[pd.DataFrame] = []
+
+        for code in sorted(codes):
+            known_dates = existing_dates.get(code, set())
+            covered = coverage_codes.get(code)
+            if (
+                not known_dates
+                or not isinstance(covered, dict)
+                or str(covered.get("from", safe_end)) > history_start
+            ):
+                start = history_start
+            else:
+                latest = pd.to_datetime(max(known_dates), format="%Y%m%d")
+                start = (
+                    (latest - pd.DateOffset(months=2)).replace(day=1).strftime("%Y%m%d")
+                )
+                start = max(start, history_start)
+            if self.options.repair_from is not None:
+                start = max(history_start, min(start, self.options.repair_from))
+            start = min(start, safe_end)
+            code_frames: list[pd.DataFrame] = []
+            for range_start, range_end in self._index_weight_ranges(start, safe_end):
+                frame = self._fetch_paginated(
+                    "index_weight",
+                    {
+                        "index_code": code,
+                        "start_date": range_start,
+                        "end_date": range_end,
+                    },
+                    5000,
+                )
+                if not frame.empty:
+                    code_frames.append(
+                        self._normalize_index_weight_frame(
+                            frame, code, range_start, range_end
+                        )
+                    )
+            if code_frames:
+                normalized = self._normalize_frame(
+                    pd.concat(code_frames, ignore_index=True, sort=False),
+                    ["index_code", "con_code", "trade_date"],
+                )
+                fetched.append(normalized)
+                existing_dates.setdefault(code, set()).update(
+                    normalized["trade_date"].astype(str)
+                )
+            previous_from = (
+                str(covered.get("from"))
+                if isinstance(covered, dict) and covered.get("from")
+                else start
+            )
+            coverage_codes[code] = {
+                "from": min(previous_from, start),
+                "through": safe_end,
+            }
+
+        missing_defaults = [
+            code for code in DEFAULT_INDEX_WEIGHT_CODES if not existing_dates.get(code)
+        ]
+        if missing_defaults:
+            raise DataError(
+                "index_weight returned no historical snapshots for default indices: "
+                f"{missing_defaults}"
+            )
+
+        publications: list[tuple[Path, Path]] = []
+        journal: list[dict[str, Any]] = []
+        combined = (
+            pd.concat(fetched, ignore_index=True, sort=False)
+            if fetched
+            else pd.DataFrame(
+                columns=["index_code", "con_code", "trade_date", "weight"]
+            )
+        )
         for trade_date, frame in combined.groupby("trade_date"):
             date = str(trade_date)
+            destination = self.options.csv_dir / "index_weight" / f"{date}.csv"
+            if destination.is_file():
+                try:
+                    existing = pd.read_csv(
+                        destination, dtype=str, keep_default_na=False
+                    )
+                except pd.errors.EmptyDataError:
+                    existing = pd.DataFrame(columns=frame.columns)
+                replaced_codes = set(frame["index_code"].astype(str))
+                if not existing.empty and "index_code" in existing:
+                    existing = existing[
+                        ~existing["index_code"]
+                        .astype(str)
+                        .str.upper()
+                        .isin(replaced_codes)
+                    ]
+                frame = pd.concat([existing, frame], ignore_index=True, sort=False)
             frame = self._normalize_frame(
-                frame, ["index_code", "con_code", "trade_date"]
+                frame,
+                ["index_code", "con_code", "trade_date"],
             )
             staged = staging / "index_weight" / f"{date}.csv"
-            journal.append(self._stage_csv(frame, staged))
-            publications.append(
-                (staged, self.options.csv_dir / "index_weight" / f"{date}.csv")
+            entry = self._stage_csv(frame, staged)
+            entry.update({"dataset": "index_weight", "snapshot_date": date})
+            journal.append(entry)
+            publications.append((staged, destination))
+
+        coverage_payload = {
+            "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
+            "codes": {code: coverage_codes[code] for code in sorted(coverage_codes)},
+        }
+        coverage_staged = staging / "index_weight" / "_coverage.json"
+        coverage_staged.parent.mkdir(parents=True, exist_ok=True)
+        coverage_staged.write_text(
+            json.dumps(coverage_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        content = coverage_staged.read_bytes()
+        journal.append(
+            {
+                "path": str(coverage_staged),
+                "rows": len(coverage_payload["codes"]),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "dataset": "index_weight_coverage",
+            }
+        )
+        publications.append(
+            (
+                coverage_staged,
+                self.options.csv_dir / "index_weight" / "_coverage.json",
             )
+        )
         return publications, journal
 
     @staticmethod
-    def _restore_files(backups: Sequence[tuple[Path, Path, bool]]) -> None:
+    def _copy_replace(source: Path, destination: Path) -> None:
+        """Atomically replace a file even when source is on another volume."""
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.parent / (
+            f".{destination.name}.tualpha-{uuid4().hex}.tmp"
+        )
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _restore_files(cls, backups: Sequence[tuple[Path, Path, bool]]) -> None:
         for destination, backup, existed in reversed(backups):
-            destination.unlink(missing_ok=True)
             if existed and backup.exists():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(backup, destination)
+                cls._copy_replace(backup, destination)
+                backup.unlink(missing_ok=True)
+            else:
+                destination.unlink(missing_ok=True)
 
     @classmethod
     def _publish_files(
@@ -648,7 +877,6 @@ class DataUpdater:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 backup = backup_root / f"{index:06d}.csv"
                 existed = destination.exists()
-                backups.append((destination, backup, existed))
                 entry = {
                     "staged": str(staged.resolve()),
                     "destination": str(destination.resolve()),
@@ -659,10 +887,11 @@ class DataUpdater:
                 entries.append(entry)
                 write_manifest()
                 if existed:
-                    os.replace(destination, backup)
-                    entry["phase"] = "backed_up"
-                    write_manifest()
-                os.replace(staged, destination)
+                    shutil.copy2(destination, backup)
+                backups.append((destination, backup, existed))
+                entry["phase"] = "backed_up"
+                write_manifest()
+                cls._copy_replace(staged, destination)
                 entry["phase"] = "published"
                 write_manifest()
         except Exception:
@@ -696,6 +925,10 @@ class DataUpdater:
                 destination = Path(entry["destination"])
                 backup = Path(entry["backup"])
                 staged = Path(entry["staged"])
+                for temporary in destination.parent.glob(
+                    f".{destination.name}.tualpha-*.tmp"
+                ):
+                    temporary.unlink(missing_ok=True)
                 changed = (
                     entry.get("phase") in {"backed_up", "published"}
                     or backup.exists()
@@ -703,10 +936,11 @@ class DataUpdater:
                 )
                 if not changed:
                     continue
-                destination.unlink(missing_ok=True)
                 if bool(entry.get("existed")) and backup.exists():
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(backup, destination)
+                    self._copy_replace(backup, destination)
+                    backup.unlink(missing_ok=True)
+                else:
+                    destination.unlink(missing_ok=True)
                 restored = True
             if restored:
                 cache = normalized_store_path(
@@ -813,7 +1047,7 @@ class DataUpdater:
                 publications.extend(financial_files)
                 journal.extend(financial_journal)
                 weight_files, weight_journal = self._download_index_weights(
-                    staging, safe_end
+                    staging, safe_end, dates
                 )
                 publications.extend(weight_files)
                 journal.extend(weight_journal)

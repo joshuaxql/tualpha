@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,11 @@ from tualpha.bundle import (
 )
 from tualpha.cli import run_cli
 from tualpha.exceptions import ConfigurationError, DataError
-from tualpha.updater import DataUpdater, UpdateOptions
+from tualpha.updater import (
+    DEFAULT_INDEX_WEIGHT_CODES,
+    DataUpdater,
+    UpdateOptions,
+)
 
 
 class FakeProClient:
@@ -88,7 +94,23 @@ class FakeProClient:
                     & (effective <= params["end_date"])
                 ]
         elif api_name == "index_weight":
-            frame = pd.DataFrame()
+            files = sorted((self.root / "index_weight").glob("*.csv"))
+            frame = (
+                pd.concat(
+                    [pd.read_csv(path, dtype=str) for path in files],
+                    ignore_index=True,
+                    sort=False,
+                )
+                if files
+                else pd.DataFrame(
+                    columns=["index_code", "con_code", "trade_date", "weight"]
+                )
+            )
+            frame = frame[
+                (frame["index_code"] == params["index_code"])
+                & (frame["trade_date"] >= params["start_date"])
+                & (frame["trade_date"] <= params["end_date"])
+            ]
         else:  # pragma: no cover - catches unexpected updater API additions
             raise AssertionError(f"unexpected API: {api_name}")
         return frame.iloc[offset : offset + limit].reset_index(drop=True)
@@ -165,7 +187,56 @@ def test_incremental_update_replaces_current_bundle(
         for name, params in client.calls
     )
     assert len(pd.read_csv(csv_dir / "income" / "20230930.csv")) == 2
+    index_calls = {
+        params["index_code"] for name, params in client.calls if name == "index_weight"
+    }
+    assert index_calls == set(DEFAULT_INDEX_WEIGHT_CODES)
+    coverage = json.loads(
+        (csv_dir / "index_weight" / "_coverage.json").read_text(encoding="utf-8")
+    )
+    assert set(coverage["codes"]) == set(DEFAULT_INDEX_WEIGHT_CODES)
     assert result.bundle_path == str(bundle_path(bundle_root))
+
+
+def test_index_weight_refresh_replaces_one_index_without_losing_others(
+    csv_dir: Path, tmp_path: Path
+) -> None:
+    target = tmp_path / "csv"
+    shutil.copytree(csv_dir, target)
+    path = target / "index_weight" / "20240104.csv"
+    existing = pd.read_csv(path, dtype=str)
+    existing.loc[len(existing)] = ["000300.SH", "000001.SZ", "20240104", "1.0"]
+    existing.to_csv(path, index=False)
+    (target / "index_weight" / "_coverage.json").unlink(missing_ok=True)
+
+    class RevisedClient(FakeProClient):
+        def query(self, api_name: str, **params: Any) -> pd.DataFrame:
+            frame = super().query(api_name, **params)
+            if api_name == "index_weight" and params["index_code"] == "000300.SH":
+                frame = frame[
+                    ~(
+                        (frame["trade_date"] == "20240104")
+                        & (frame["con_code"] == "000001.SZ")
+                    )
+                ]
+            return frame.reset_index(drop=True)
+
+    updater = DataUpdater(
+        UpdateOptions(csv_dir=target, bundle_root=tmp_path / "bundle", retries=1),
+        client=RevisedClient(target),
+    )
+    publications, _ = updater._download_index_weights(
+        tmp_path / "staging", "20240108", ["20240108"]
+    )
+    staged = next(
+        source
+        for source, destination in publications
+        if destination.name == "20240104.csv"
+    )
+    refreshed = pd.read_csv(staged, dtype=str)
+    latest_300 = refreshed[refreshed["index_code"] == "000300.SH"]
+    assert latest_300["con_code"].tolist() == ["688001.SH"]
+    assert set(refreshed["index_code"]) == set(DEFAULT_INDEX_WEIGHT_CODES)
 
 
 def test_dry_run_status_keeps_request_and_build_history(
@@ -304,6 +375,29 @@ def test_interrupted_csv_publication_is_recovered(
     assert status["error"]["type"] == "InterruptedUpdate"
 
 
+def test_csv_publication_uses_only_same_directory_atomic_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = tmp_path / "staging" / "new.csv"
+    destination = tmp_path / "external" / "data.csv"
+    staged.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True)
+    staged.write_text("new\n", encoding="utf-8")
+    destination.write_text("old\n", encoding="utf-8")
+    original_replace = os.replace
+
+    def same_directory_replace(source: str | Path, target: str | Path) -> None:
+        assert Path(source).parent == Path(target).parent
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", same_directory_replace)
+    backups = DataUpdater._publish_files([(staged, destination)], tmp_path / "backups")
+    assert destination.read_text(encoding="utf-8") == "new\n"
+    assert staged.read_text(encoding="utf-8") == "new\n"
+    DataUpdater._restore_files(backups)
+    assert destination.read_text(encoding="utf-8") == "old\n"
+
+
 def test_missing_dataset_partitions_are_backfilled(
     csv_dir: Path, tmp_path: Path
 ) -> None:
@@ -324,6 +418,14 @@ def test_missing_dataset_partitions_are_backfilled(
         "20240104",
         "20240105",
         "20240108",
+    ]
+
+
+def test_index_weight_backfill_is_split_into_calendar_years() -> None:
+    assert DataUpdater._index_weight_ranges("20091201", "20110203") == [
+        ("20091201", "20091231"),
+        ("20100101", "20101231"),
+        ("20110101", "20110203"),
     ]
 
 

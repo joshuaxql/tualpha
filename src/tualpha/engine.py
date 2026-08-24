@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from .api import bind_algorithm
 from .assets import Asset, AssetFinder
@@ -439,23 +440,32 @@ class TradingAlgorithm:
 
         previous_session: pd.Timestamp | None = None
         previous_value = self.config.capital_base
-        for session in self.sessions:
-            self.current_session = session
-            self.context.datetime = session
-            self.data._set_session(session)
-            self._current_records = {}
-            self.broker.apply_corporate_actions(previous_session, session)
-            transaction_start = len(self.broker.transactions)
-            self.broker.process_orders(session)
-            self.broker.mark_to_market(session)
+        with tqdm(
+            self.sessions,
+            total=len(self.sessions),
+            desc=f"TuAlpha 回测：{self.config.strategy_name}",
+            unit="交易日",
+            dynamic_ncols=True,
+            disable=not self.config.show_progress,
+        ) as progress:
+            for session in progress:
+                progress.set_postfix_str(session.strftime("%Y-%m-%d"), refresh=False)
+                self.current_session = session
+                self.context.datetime = session
+                self.data._set_session(session)
+                self._current_records = {}
+                self.broker.apply_corporate_actions(previous_session, session)
+                transaction_start = len(self.broker.transactions)
+                self.broker.process_orders(session)
+                self.broker.mark_to_market(session)
 
-            with bind_algorithm(self):
-                self._phase = "handle_data"
-                self.handle_data_callback(self.context, self.data)
-            self.broker.mark_to_market(session)
-            self._capture_session(session, previous_value, transaction_start)
-            previous_value = self.portfolio.portfolio_value
-            previous_session = session
+                with bind_algorithm(self):
+                    self._phase = "handle_data"
+                    self.handle_data_callback(self.context, self.data)
+                self.broker.mark_to_market(session)
+                self._capture_session(session, previous_value, transaction_start)
+                previous_value = self.portfolio.portfolio_value
+                previous_session = session
 
         self.broker.cancel_remaining()
         self._phase = "finished"
@@ -519,11 +529,15 @@ def run_algorithm(
     benchmark: str | None = None,
     strategy_name: str = "TuAlpha 回测策略",
     generate_report: bool = True,
+    show_progress: bool = True,
     plotly_js: PlotlyJsMode | str = PlotlyJsMode.INLINE,
     bundle_name: str = "tualpha",
     fee_model: ChinaFeeModel | None = None,
 ) -> BacktestResult:
-    """Run a point-in-time daily stock/ETF backtest."""
+    """Run a point-in-time daily stock/ETF backtest.
+
+    Set ``show_progress=False`` to disable the default tqdm session progress bar.
+    """
 
     config = BacktestConfig(
         start=start,
@@ -536,6 +550,7 @@ def run_algorithm(
         benchmark=benchmark,
         strategy_name=strategy_name,
         generate_report=generate_report,
+        show_progress=show_progress,
         plotly_js=plotly_js,
         bundle_name=bundle_name,
     )

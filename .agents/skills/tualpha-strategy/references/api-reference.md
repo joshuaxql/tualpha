@@ -189,6 +189,20 @@ reports = data.fundamentals(
 - 默认只选择合并报表 `report_type="1"`；
 - `fina_indicator` 没有 report type 过滤。
 
+## PIT 指数成分
+
+```python
+members = data.index_constituents("000300.SH")
+```
+
+返回以 `ts_code` 为索引的 `DataFrame`，列为：
+
+- `asset`：对应的 TuAlpha `Asset`，无法映射时为 `None`；
+- `weight`：Tushare 原始百分比权重；
+- `snapshot_date`：当前可见快照日期。
+
+仅选择 `snapshot_date < context.datetime` 的最新月度快照，所以 D 日快照从 D+1 回调起可见。首个快照前返回同结构的空表。默认支持 `000300.SH`、`000852.SH`、`000905.SH`、`000906.SH` 和 `899050.BJ`。
+
 ## 字段发现
 
 ```python
@@ -260,10 +274,13 @@ result = run_algorithm(
     output_dir="outputs/my_strategy",
     strategy_name="策略名称",
     generate_report=True,
+    show_progress=True,  # 使用 tqdm 显示交易日进度
     plotly_js="inline",  # inline / cdn
     fee_model=None,
 )
 ```
+
+`show_progress=True` 为默认值，显示已处理交易日、百分比、速度、预计剩余时间和当前日期。批处理、测试或嵌套运行时可设为 `False`。
 
 ## 回测结果
 
@@ -288,3 +305,5 @@ output_dir/
 ├── report.html
 └── daily_positions.csv
 ```
+
+`report.html` 的组合归因表包含每个标的的成交次数、持有总天数、已实现盈亏、贡献占比和总费用。持有总天数按日终持仓数量大于零的唯一交易日统计。

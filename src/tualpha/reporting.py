@@ -345,8 +345,17 @@ def _metric_card(label: str, value: str, css_class: str = "") -> str:
 def _attribution_rows(result: BacktestResult) -> str:
     trades = result.closed_trades
     transactions = result.transactions
-    if trades.empty and transactions.empty:
-        return '<tr><td colspan="5" class="muted">无交易归因数据</td></tr>'
+    positions = result.daily_positions
+    holding_days = pd.Series(dtype=int)
+    position_columns = {"record_type", "ts_code", "date", "quantity"}
+    if not positions.empty and position_columns.issubset(positions.columns):
+        held = positions[
+            positions["record_type"].eq("POSITION")
+            & pd.to_numeric(positions["quantity"], errors="coerce").gt(0)
+        ]
+        holding_days = held.groupby("ts_code")["date"].nunique()
+    if trades.empty and transactions.empty and holding_days.empty:
+        return '<tr><td colspan="6" class="muted">无交易归因数据</td></tr>'
     pnl = (
         trades.groupby("ts_code")["pnl"].sum()
         if not trades.empty
@@ -362,7 +371,7 @@ def _attribution_rows(result: BacktestResult) -> str:
         if not transactions.empty
         else pd.Series(dtype=float)
     )
-    codes = pnl.index.union(counts.index).union(fees.index)
+    codes = pnl.index.union(counts.index).union(fees.index).union(holding_days.index)
     total_pnl = float(pnl.sum())
     rows = []
     for code in sorted(codes, key=lambda item: float(pnl.get(item, 0.0)), reverse=True):
@@ -372,6 +381,7 @@ def _attribution_rows(result: BacktestResult) -> str:
             "<tr>"
             f"<td>{escape(str(code))}</td>"
             f"<td>{int(counts.get(code, 0))}</td>"
+            f"<td>{int(holding_days.get(code, 0))}</td>"
             f"<td>{_money(value)}</td>"
             f"<td>{_percent(contribution)}</td>"
             f"<td>{_money(fees.get(code, 0.0))}</td>"
@@ -508,11 +518,11 @@ footer{{text-align:center;margin-top:45px;padding-top:18px;border-top:1px solid 
 <div class="section-title">收益分析 (Return Analysis)</div><div class="row"><div class="chart">{figures[1]}</div><div class="chart">{figures[2]}</div></div><div class="chart">{figures[3]}</div>
 <div class="section-title">基准对比 (Benchmark Comparison)</div>{benchmark_metrics}<div class="chart">{figures[4]}</div>
 <div class="section-title">交易分析 (Trade Analysis)</div><div class="row"><div class="chart">{figures[5]}</div><div class="chart">{figures[6]}</div></div>
-<div class="section-title">费用与交易限制</div><div class="row">
+<div class="section-title">费用与交易限制 (Fees & Trading Constraints)</div><div class="row">
 <div class="table-wrap"><table><thead><tr><th>费用项目</th><th>金额</th></tr></thead><tbody>{fee_rows}</tbody></table></div>
 <div class="table-wrap"><table><thead><tr><th>拒单原因</th><th>次数</th></tr></thead><tbody>{_rejection_rows(result)}</tbody></table></div>
 </div>
-<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>已实现盈亏</th><th>贡献占比</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
+<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>贡献占比</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
 <footer>TuAlpha Report · Powered by Plotly · 股票与 ETF 日频回测</footer>
 </div></body></html>"""
     destination = Path(path)

@@ -60,6 +60,27 @@ def test_data_portal_closes_when_strategy_raises(data_root: Path) -> None:
     competing.release()
 
 
+def test_run_algorithm_shows_and_can_hide_progress(
+    data_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = {
+        "start": "2024-01-02",
+        "end": "2024-01-03",
+        "bundle_root": data_root,
+        "generate_report": False,
+        "strategy_name": "进度测试",
+    }
+
+    run_algorithm(**common)
+    progress_output = capsys.readouterr().err
+    assert "TuAlpha 回测：进度测试" in progress_output
+    assert "100%" in progress_output
+    assert "2024-01-03" in progress_output
+
+    run_algorithm(**common, show_progress=False)
+    assert capsys.readouterr().err == ""
+
+
 def test_open_and_close_execution_check_only_selected_endpoint(data_root: Path) -> None:
     initialize, handle_data = _single_order_strategy("000001.SZ")
     open_result = run_algorithm(
@@ -221,8 +242,10 @@ def test_report_and_daily_positions_are_exported(
     assert result.positions_path == tmp_path / "daily_positions.csv"
     report = result.report_path.read_text(encoding="utf-8")
     assert "核心指标 (Key Metrics)" in report
-    assert "费用与交易限制" in report
+    assert "费用与交易限制 (Fees & Trading Constraints)" in report
     assert "组合归因 (Attribution)" in report
+    assert "<th>持有总天数</th>" in report
+    assert "<tr><td>000001.SZ</td><td>2</td><td>1</td>" in report
     assert "plotly" in report.lower()
     assert result.positions_path.read_bytes().startswith(b"\xef\xbb\xbf")
     positions = pd.read_csv(result.positions_path, encoding="utf-8-sig")

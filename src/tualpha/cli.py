@@ -45,7 +45,13 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--retries", type=int, default=3)
     update.add_argument("--backoff", type=float, default=2.0)
     update.add_argument("--token-stdin", action="store_true")
-    update.add_argument("--index-weight", action="append", default=[])
+    update.add_argument(
+        "--index-weight",
+        action="append",
+        default=[],
+        metavar="INDEX_CODE",
+        help="add an index beyond the five default PIT constituent datasets",
+    )
     update.add_argument("--dry-run", action="store_true")
     update.add_argument("--show-progress", action="store_true")
     update.add_argument("--json", action="store_true", dest="json_output")

@@ -388,6 +388,37 @@ def csv_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
             root / "index_daily" / f"{date}.csv",
         )
 
+    index_codes = [
+        "000300.SH",
+        "000852.SH",
+        "000905.SH",
+        "000906.SH",
+        "899050.BJ",
+    ]
+    initial_weights = [
+        [index_code, constituent, "20240102", weight]
+        for index_code in index_codes
+        for constituent, weight in (("000001.SZ", 60.0), ("688001.SH", 40.0))
+    ]
+    revised_weights = [
+        [index_code, constituent, "20240104", weight]
+        for index_code in index_codes
+        for constituent, weight in (
+            (("688001.SH", 100.0),)
+            if index_code == "000300.SH"
+            else (("000001.SZ", 60.0), ("688001.SH", 40.0))
+        )
+    ]
+    weight_columns = ["index_code", "con_code", "trade_date", "weight"]
+    _write(
+        pd.DataFrame(initial_weights, columns=weight_columns),
+        root / "index_weight" / "20240102.csv",
+    )
+    _write(
+        pd.DataFrame(revised_weights, columns=weight_columns),
+        root / "index_weight" / "20240104.csv",
+    )
+
     statement_specs = {
         "balancesheet": ("total_assets", [1000.0, 1100.0, 1200.0]),
         "income": ("revenue", [100.0, 110.0, 120.0]),

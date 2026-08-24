@@ -1836,7 +1836,7 @@ wheels = [
 
 [[package]]
 name = "tualpha"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "bcolz-zipline" },
@@ -1845,6 +1845,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "plotly" },
+    { name = "tqdm" },
     { name = "tushare" },
     { name = "zipline-reloaded" },
 ]
@@ -1864,6 +1865,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "plotly", specifier = ">=5.24" },
+    { name = "tqdm", specifier = ">=4.67" },
     { name = "tushare", specifier = ">=1.4" },
     { name = "zipline-reloaded", specifier = "==3.1.1" },
 ]
