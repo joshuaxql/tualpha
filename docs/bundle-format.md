@@ -56,6 +56,25 @@ bundle/
 
 每个 dataset 内按日期严格升序，日频主键唯一。构建器整代重建文件，不原地修改活动 Bundle。
 
+常用横截面字段可同时存在于内部 packed 加速组：
+
+```text
+/packed/<field>
+layout = tradable_sid_dense/v1
+```
+
+packed 数组按可交易资产 `sid` 升序拼接，证券内顺序与 `/data/<ts_code>` 完全一致；Reader 使用 `assets.pk` 和日线长度计算切片。它只是同一 HDF5 文件内的冗余加速索引，不是策略可直接访问的新数据源。缺少 packed 组的早期 schema 7 Bundle 仍可通过逐证券回退路径读取。
+
+当前 packed 字段：
+
+```text
+daily       : open, high, low, close, pre_close, volume, turnover
+daily_basic : total_mv
+stk_limit   : up_limit, down_limit
+stock_st    : is_st
+suspend_d   : suspended
+```
+
 数值约定：
 
 - 日期：little-endian `int32 YYYYMMDD`；
@@ -279,7 +298,7 @@ allow_pickle: False
 protocol, schema_version, generation, generated_at,
 start_session, end_session, session_count,
 asset_count, index_count, calendar_source,
-build_pipeline, files, assets, index_codes, pit_rules
+build_pipeline, packed_acceleration, files, assets, index_codes, pit_rules
 ```
 
 每个资产：
@@ -292,7 +311,7 @@ round_lot, minimum_order, settlement_days
 
 `sid` 从现有活动 `assets.pk` 继承；首次迁移可读取旧 sid-map，随后稳定映射只保存在活动 `assets.pk`。
 
-`files` 记录其他 11 个文件的角色、行数、大小和 SHA-256。
+`files` 记录其他 11 个文件的角色、行数、大小和 SHA-256。`packed_acceleration` 记录布局、拼接行数及各文件加速字段。
 
 ## 15. generation 和验证
 

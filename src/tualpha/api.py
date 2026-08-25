@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Protocol
@@ -23,6 +23,13 @@ class _AlgorithmAPI(Protocol):
     def submit_order_target(
         self, asset: Asset | str, target: float
     ) -> Order | None: ...
+
+    def submit_order_targets(
+        self,
+        targets: Mapping[Asset | str, float],
+        *,
+        position_limit: int | None = None,
+    ) -> list[Order]: ...
 
     def submit_order_target_value(
         self, asset: Asset | str, target: float
@@ -87,8 +94,16 @@ def order_target(asset: Asset | str, target: float) -> Order | None:
     return _active().submit_order_target(asset, target)
 
 
+def order_target_many(
+    targets: Mapping[Asset | str, float], *, position_limit: int | None = None
+) -> list[Order]:
+    """Submit cash-adaptive D+1 targets with an optional position cap."""
+
+    return _active().submit_order_targets(targets, position_limit=position_limit)
+
+
 def order_target_value(asset: Asset | str, target: float) -> Order | None:
-    """Move a position toward a target raw market value."""
+    """Move toward a value using D+1 cash-adaptive partial execution."""
 
     return _active().submit_order_target_value(asset, target)
 
@@ -100,7 +115,7 @@ def order_percent(asset: Asset | str, percent: float) -> Order | None:
 
 
 def order_target_percent(asset: Asset | str, target: float) -> Order | None:
-    """Move a position toward a fraction of current portfolio value."""
+    """Move toward a weight using D+1 cash-adaptive partial execution."""
 
     if target < 0:
         raise ValueError("negative targets would create a short position")

@@ -43,6 +43,8 @@ from ._hdf5_store import (
     BUNDLE_PROTOCOL,
     BUNDLE_SCHEMA_VERSION,
     HDF5_FILES,
+    PACKED_ACCELERATION_FIELDS,
+    PACKED_LAYOUT,
     REQUIRED_BUNDLE_FILES,
     TRADE_DATES_FILE,
     date_to_int,
@@ -145,6 +147,101 @@ def _asset_payload(record: Any, *, tradable: bool) -> dict[str, Any]:
     }
 
 
+def _flush_packed_buffer(
+    fields: Sequence[str],
+    destinations: dict[str, h5py.Dataset],
+    pending: dict[str, list[np.ndarray]],
+    cursor: int,
+    row_count: int,
+) -> int:
+    if not row_count:
+        return cursor
+    stop = cursor + row_count
+    for field in fields:
+        destinations[field][cursor:stop] = np.concatenate(pending[field])
+        pending[field].clear()
+    return stop
+
+
+def _write_packed_acceleration(
+    handles: dict[str, h5py.File], records: Sequence[Any]
+) -> tuple[int, dict[str, tuple[str, ...]]]:
+    """Materialize common hot columns in stable sid-major row order."""
+
+    ordered = sorted(records, key=lambda record: int(record.sid))
+    daily = handles["daily"]["data"]
+    lengths = {
+        str(record.ts_code): len(daily[str(record.ts_code)]) for record in ordered
+    }
+    packed_rows = sum(lengths.values())
+    if not packed_rows:
+        raise DataError("cannot build packed acceleration without tradable daily rows")
+
+    for role, fields in PACKED_ACCELERATION_FIELDS.items():
+        handle = handles[role]
+        source_group = handle["data"]
+        packed = handle.create_group("packed", track_order=True)
+        packed.attrs.update(
+            {
+                "layout": PACKED_LAYOUT,
+                "row_count": np.uint64(packed_rows),
+                "fields": json.dumps(list(fields)),
+            }
+        )
+        handle.attrs["packed_layout"] = PACKED_LAYOUT
+        handle.attrs["packed_fields"] = json.dumps(list(fields))
+
+        sample = next(
+            (
+                source_group[str(record.ts_code)]
+                for record in ordered
+                if str(record.ts_code) in source_group
+            ),
+            None,
+        )
+        if sample is None:
+            raise DataError(f"cannot build packed acceleration for empty role: {role}")
+        missing = [field for field in fields if field not in (sample.dtype.names or ())]
+        if missing:
+            raise DataError(f"packed source fields are missing in {role}: {missing}")
+        destinations = {
+            field: packed.create_dataset(
+                field,
+                shape=(packed_rows,),
+                dtype=sample.dtype.fields[field][0],
+                track_times=False,
+            )
+            for field in fields
+        }
+        pending: dict[str, list[np.ndarray]] = {field: [] for field in fields}
+        pending_rows = 0
+        cursor = 0
+
+        for record in ordered:
+            code = str(record.ts_code)
+            dataset = source_group.get(code)
+            if dataset is None:
+                raise DataError(f"packed source dataset is missing: {role}/{code}")
+            expected = lengths[code]
+            if len(dataset) != expected:
+                raise DataError(f"packed source rows do not align: {role}/{code}")
+            source = np.asarray(dataset.fields(list(fields))[:])
+            for field in fields:
+                pending[field].append(np.asarray(source[field]))
+            pending_rows += expected
+            if pending_rows >= 262_144:
+                cursor = _flush_packed_buffer(
+                    fields, destinations, pending, cursor, pending_rows
+                )
+                pending_rows = 0
+        cursor = _flush_packed_buffer(
+            fields, destinations, pending, cursor, pending_rows
+        )
+        if cursor != packed_rows:
+            raise DataError(f"packed row count is incomplete for role: {role}")
+    return packed_rows, dict(PACKED_ACCELERATION_FIELDS)
+
+
 def _write_bundle_files(
     output_dir: Path,
     csv_dir: Path,
@@ -206,6 +303,8 @@ def _write_bundle_files(
                     calendar,
                 )
                 shutil.rmtree(buckets.root, ignore_errors=True)
+
+            packed_rows, packed_fields = _write_packed_acceleration(handles, records)
 
             finance = handles["finance"]
             finance_root = finance["data"]
@@ -294,6 +393,11 @@ def _write_bundle_files(
         "index_count": len(benchmark_records),
         "calendar_source": f"{CALENDAR_SOURCE}:{CALENDAR_EXCHANGE}",
         "build_pipeline": "csv->staging-hash-buckets->sorted-hdf5",
+        "packed_acceleration": {
+            "layout": PACKED_LAYOUT,
+            "row_count": packed_rows,
+            "fields": {role: list(fields) for role, fields in packed_fields.items()},
+        },
         "files": files,
         "assets": asset_rows,
         "index_codes": index_codes,
@@ -333,6 +437,26 @@ def validate_hdf5_bundle(
         try:
             if not full_scan:
                 continue
+            packed_metadata = manifest.get("packed_acceleration", {})
+            expected_roles = packed_metadata.get("fields", {})
+            if role in expected_roles:
+                packed = handle.get("packed")
+                if not isinstance(packed, h5py.Group):
+                    raise DataError(f"packed acceleration is missing: {role}.h5")
+                if str(packed.attrs.get("layout", "")) != PACKED_LAYOUT:
+                    raise DataError(f"packed acceleration layout is invalid: {role}.h5")
+                expected_rows = int(packed_metadata.get("row_count", -1))
+                expected_fields = tuple(str(field) for field in expected_roles[role])
+                if set(packed) != set(expected_fields):
+                    raise DataError(
+                        f"packed acceleration fields are invalid: {role}.h5"
+                    )
+                for field in expected_fields:
+                    dataset = packed[field]
+                    if dataset.ndim != 1 or len(dataset) != expected_rows:
+                        raise DataError(
+                            f"packed acceleration rows are invalid: {role}.{field}"
+                        )
             for dataset in _iter_compound_datasets(handle["data"]):
                 if dataset.dtype.names is None:
                     raise DataError(f"non-compound HDF5 dataset: {dataset.name}")
@@ -529,6 +653,7 @@ def _record_bundle_build(
         "storage": "hdf5",
         "bundle_schema": BUNDLE_SCHEMA_VERSION,
         "build_pipeline": manifest["build_pipeline"],
+        "packed_acceleration": manifest.get("packed_acceleration"),
     }
     payload = {
         "schema_version": UPDATE_STATUS_SCHEMA_VERSION,

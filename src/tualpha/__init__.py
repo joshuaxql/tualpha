@@ -6,6 +6,7 @@ from .api import (
     order,
     order_percent,
     order_target,
+    order_target_many,
     order_target_percent,
     order_target_value,
     order_value,
@@ -56,6 +57,7 @@ __all__ = [
     "order",
     "order_percent",
     "order_target",
+    "order_target_many",
     "order_target_percent",
     "order_target_value",
     "order_value",
@@ -65,7 +67,7 @@ __all__ = [
     "symbol",
 ]
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 
 def main() -> None:

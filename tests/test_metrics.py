@@ -29,3 +29,47 @@ def test_sortino_uses_all_period_downside_deviation() -> None:
     )
     metrics = calculate_metrics(performance, pd.DataFrame(), positions)
     assert np.isfinite(metrics["sortino"])
+
+
+def test_open_positions_exclude_zero_value_delisted_audit_rows() -> None:
+    date = pd.Timestamp("2024-01-02")
+    performance = pd.DataFrame(
+        {
+            "returns": [0.0],
+            "portfolio_value": [100_000.0],
+            "algorithm_period_return": [0.0],
+            "commission": [0.0],
+            "stamp_tax": [0.0],
+            "handling_fee": [0.0],
+            "transfer_fee": [0.0],
+            "fees": [0.0],
+            "turnover": [0.0],
+        },
+        index=[date],
+    )
+    positions = pd.DataFrame(
+        [
+            {
+                "date": date,
+                "record_type": "POSITION",
+                "ts_code": "LIVE",
+                "market_value": 90_000.0,
+            },
+            {
+                "date": date,
+                "record_type": "POSITION",
+                "ts_code": "DELISTED",
+                "market_value": 0.0,
+            },
+            {
+                "date": date,
+                "record_type": "CASH",
+                "ts_code": "CASH",
+                "market_value": 10_000.0,
+            },
+        ]
+    )
+
+    metrics = calculate_metrics(performance, pd.DataFrame(), positions)
+
+    assert metrics["open_positions"] == 1

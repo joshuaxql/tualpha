@@ -8,7 +8,13 @@ import h5py
 import pandas as pd
 import pytest
 
-from tualpha._hdf5_store import REQUIRED_BUNDLE_FILES
+from tualpha import _data_v8
+from tualpha._hdf5_store import (
+    HDF5_FILES,
+    REQUIRED_BUNDLE_FILES,
+    load_assets_manifest,
+    write_assets_manifest,
+)
 from tualpha.assets import AssetFinder, Board
 from tualpha.bundle import latest_bundle_path
 from tualpha.calendar import ChinaTradingCalendar
@@ -41,6 +47,10 @@ def test_extended_daily_fields_are_available_without_csv_reads(data_root: Path) 
     assert portal.value(stock, "2024-01-04", "stock_st.is_st") == 1.0
     assert portal.value(stock, "2024-01-04", "stock_st.name") == "ST测试"
 
+    def fail_session_loop(*args: object, **kwargs: object) -> object:
+        raise AssertionError("history must gather the complete matrix without values()")
+
+    portal.values = fail_session_loop  # type: ignore[method-assign]
     history = portal.history(
         [stock],
         ["daily_basic.pe", "industry.l1_name", "stock_st.is_st"],
@@ -108,12 +118,82 @@ def test_vectorized_current_matches_scalar_values_and_uses_bounded_cache(
     monkeypatch.setattr(portal, "value", fail_scalar)
     fresh = data.current(assets, fields)
     assert fresh.loc["000001.SZ", "daily_basic.pe"] == original
+    arrays = data.current_arrays(assets, fields)
+    assert arrays["close"].tolist() == pytest.approx(
+        frame["close"].astype(float).tolist(), nan_ok=True
+    )
+    assert all(not values.flags.writeable for values in arrays.values())
+    with pytest.raises(ValueError, match="read-only"):
+        arrays["close"][0] = -1.0
+
     assert portal._column_cache
-    assert portal._column_cache_bytes <= 1024 * 1024**2
+    assert portal._column_cache_bytes <= portal._column_cache_max_bytes
     assert all(not values.flags.writeable for values in portal._column_cache.values())
+    assert portal._query_plan(assets) is portal._query_plan(tuple(assets))
     portal.clear_cache()
     assert not portal._column_cache
     assert portal._column_cache_bytes == 0
+    portal.close()
+
+
+def test_schema7_reader_falls_back_when_packed_acceleration_is_absent(
+    data_root: Path, tmp_path: Path
+) -> None:
+    fallback_root = tmp_path / "fallback"
+    fallback_bundle = fallback_root / "bundle"
+    shutil.copytree(latest_bundle_path(data_root), fallback_bundle)
+    manifest = load_assets_manifest(fallback_bundle / "assets.pk")
+    manifest.pop("packed_acceleration", None)
+    for filename in HDF5_FILES:
+        with h5py.File(fallback_bundle / filename, "r+") as handle:
+            if "packed" in handle:
+                del handle["packed"]
+            for attribute in ("packed_layout", "packed_fields"):
+                if attribute in handle.attrs:
+                    del handle.attrs[attribute]
+        manifest["files"][filename]["size"] = (
+            (fallback_bundle / filename).stat().st_size
+        )
+    write_assets_manifest(fallback_bundle / "assets.pk", manifest)
+
+    finder = AssetFinder(fallback_root)
+    calendar = ChinaTradingCalendar(fallback_root)
+    stock = finder.retrieve_asset("000001.SZ")
+    portal = TushareDataPortal(fallback_root, finder, calendar, "raw", "2024-01-08")
+    assert portal.value(stock, "2024-01-03", "close") == 11.0
+    assert pd.isna(portal.value(stock, "2024-01-03", "daily_basic.total_mv"))
+    portal.close()
+
+
+def test_packed_hot_columns_do_not_scan_per_security_datasets(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = [
+        finder.retrieve_asset(code) for code in ("000001.SZ", "688001.SH", "510300.SH")
+    ]
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+
+    def fail_per_security_read(*args: object, **kwargs: object) -> object:
+        raise AssertionError("packed hot columns must not scan data/<ts_code>")
+
+    monkeypatch.setattr(_data_v8, "_field_array", fail_per_security_read)
+    values = portal.values(
+        assets,
+        "2024-01-03",
+        [
+            "open",
+            "close",
+            "volume",
+            "up_limit",
+            "down_limit",
+            "suspended",
+            "daily_basic.total_mv",
+            "stock_st.is_st",
+        ],
+    )
+    assert values["close"].tolist() == pytest.approx([11.0, 20.0, 4.0])
     portal.close()
 
 

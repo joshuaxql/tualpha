@@ -33,6 +33,14 @@ HDF5_FILES: dict[str, str] = {
     "suspend_d.h5": "suspend_d",
 }
 REQUIRED_BUNDLE_FILES = frozenset({ASSETS_FILE, TRADE_DATES_FILE, *HDF5_FILES})
+PACKED_LAYOUT = "tradable_sid_dense/v1"
+PACKED_ACCELERATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "daily": ("open", "high", "low", "close", "pre_close", "volume", "turnover"),
+    "daily_basic": ("total_mv",),
+    "stk_limit": ("up_limit", "down_limit"),
+    "stock_st": ("is_st",),
+    "suspend_d": ("suspended",),
+}
 
 
 def date_to_int(value: object) -> int:

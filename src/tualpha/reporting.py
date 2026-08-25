@@ -309,30 +309,39 @@ def _geometric_link(returns: pd.Series) -> float:
 
 
 def _geometric_attribution(result: BacktestResult) -> pd.Series:
-    if result.performance.empty or "returns" not in result.performance:
-        return pd.Series(dtype=float)
-    returns = pd.to_numeric(result.performance["returns"], errors="coerce").fillna(0.0)
-    assigned = pd.Series("CASH", index=returns.index, dtype=object)
+    """Accumulate daily end-weight × asset-return contributions by report group."""
+
     positions = result.daily_positions
-    required = {"record_type", "ts_code", "date", "quantity", "market_value"}
-    if not positions.empty and required.issubset(positions.columns):
-        held = positions[
-            positions["record_type"].eq("POSITION")
-            & pd.to_numeric(positions["quantity"], errors="coerce").gt(0)
-            & pd.to_numeric(positions["market_value"], errors="coerce").gt(0)
-        ].copy()
-        if not held.empty:
-            held["date"] = pd.to_datetime(held["date"]).dt.normalize()
-            daily_values = (
-                held.groupby(["date", "ts_code"])["market_value"]
-                .sum()
-                .unstack(fill_value=0.0)
-            )
-            dominant = daily_values.idxmax(axis=1)
-            common = assigned.index.intersection(dominant.index)
-            assigned.loc[common] = dominant.loc[common]
-    frame = pd.DataFrame({"group": assigned, "return": returns}, index=returns.index)
-    return frame.groupby("group", sort=False)["return"].apply(_geometric_link)
+    required = {"record_type", "ts_code", "date", "quantity", "market_value", "weight"}
+    if positions.empty or not required.issubset(positions.columns):
+        return pd.Series({"CASH": 0.0}, dtype=float)
+    held = positions[
+        positions["record_type"].eq("POSITION")
+        & pd.to_numeric(positions["quantity"], errors="coerce").gt(0)
+        & pd.to_numeric(positions["market_value"], errors="coerce").gt(0)
+    ].copy()
+    if held.empty:
+        return pd.Series({"CASH": 0.0}, dtype=float)
+    held["date"] = pd.to_datetime(held["date"]).dt.normalize()
+    weights = pd.to_numeric(held["weight"], errors="coerce").fillna(0.0)
+    if "asset_return" in held:
+        asset_returns = pd.to_numeric(held["asset_return"], errors="coerce").fillna(0.0)
+    elif "adjusted_close" in held:
+        held = held.sort_values(["ts_code", "date"])
+        weights = pd.to_numeric(held["weight"], errors="coerce").fillna(0.0)
+        asset_returns = (
+            pd.to_numeric(held["adjusted_close"], errors="coerce")
+            .groupby(held["ts_code"])
+            .pct_change(fill_method=None)
+            .fillna(0.0)
+        )
+    else:
+        asset_returns = pd.Series(0.0, index=held.index)
+    held["weighted_contribution"] = weights * asset_returns
+    daily = held.groupby(["date", "ts_code"], sort=False)["weighted_contribution"].sum()
+    attribution = daily.groupby("ts_code", sort=False).sum().astype(float)
+    attribution.loc["CASH"] = 0.0
+    return attribution
 
 
 def _attribution_rows(result: BacktestResult) -> str:
@@ -340,13 +349,26 @@ def _attribution_rows(result: BacktestResult) -> str:
     transactions = result.transactions
     positions = result.daily_positions
     holding_days = pd.Series(dtype=int)
-    position_columns = {"record_type", "ts_code", "date", "quantity"}
+    position_columns = {
+        "record_type",
+        "ts_code",
+        "date",
+        "quantity",
+        "market_value",
+    }
     if not positions.empty and position_columns.issubset(positions.columns):
+        market_values = pd.to_numeric(positions["market_value"], errors="coerce")
         held = positions[
             positions["record_type"].eq("POSITION")
             & pd.to_numeric(positions["quantity"], errors="coerce").gt(0)
+            & market_values.gt(0)
         ]
         holding_days = held.groupby("ts_code")["date"].nunique()
+        cash = positions[positions["record_type"].eq("CASH") & market_values.gt(0)]
+        if not cash.empty:
+            held_dates = pd.Index(pd.to_datetime(held["date"]).dt.normalize().unique())
+            cash_dates = pd.Index(pd.to_datetime(cash["date"]).dt.normalize().unique())
+            holding_days.loc["CASH"] = len(cash_dates.difference(held_dates))
     if trades.empty and transactions.empty and holding_days.empty:
         return '<tr><td colspan="7" class="muted">无交易归因数据</td></tr>'
     pnl = (
@@ -523,8 +545,7 @@ footer{{text-align:center;margin-top:45px;padding-top:18px;border-top:1px solid 
 <div class="table-wrap"><table><thead><tr><th>费用项目</th><th>金额</th></tr></thead><tbody>{fee_rows}</tbody></table></div>
 <div class="table-wrap"><table><thead><tr><th>拒单原因</th><th>次数</th></tr></thead><tbody>{_rejection_rows(result)}</tbody></table></div>
 </div>
-<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>盈亏贡献占比</th><th>几何贡献收益</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
-<p class="muted">几何贡献收益按日终市值最大的实际持仓归属每日组合收益，并按 ∏(1+r)-1 链接；例如 +5% 后 -3% 为 1.05×0.97-1=1.85%。</p>
+<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>盈亏贡献占比</th><th>几何贡献收益（每日权重贡献累计）</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
 <footer>TuAlpha Report · Powered by Plotly · 股票与 ETF 日频回测</footer>
 </div></body></html>"""
     destination = Path(path)

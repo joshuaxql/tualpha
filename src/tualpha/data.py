@@ -101,6 +101,23 @@ class BarData:
             )
         return pd.DataFrame(values, index=index)
 
+    def current_arrays(
+        self, assets: Asset | Iterable[Asset], fields: str | Iterable[str]
+    ) -> dict[str, np.ndarray]:
+        """Return read-only NumPy arrays for a batch current-data query."""
+
+        asset_list, _ = self._asset_list(assets)
+        field_list, _ = self._field_list(fields)
+        values = self._portal.values(
+            asset_list,
+            self.current_session,
+            field_list,
+            adjusted=True,
+        )
+        for array in values.values():
+            array.setflags(write=False)
+        return values
+
     def raw_current(self, asset: Asset, field: str) -> object:
         return self._portal.value(asset, self.current_session, field, adjusted=False)
 

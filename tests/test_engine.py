@@ -11,6 +11,9 @@ from tualpha import (
     TradingAlgorithm,
     order,
     order_target,
+    order_target_many,
+    order_target_percent,
+    order_target_value,
     run_algorithm,
     symbol,
 )
@@ -79,6 +82,251 @@ def test_run_algorithm_shows_and_can_hide_progress(
 
     run_algorithm(**common, show_progress=False)
     assert capsys.readouterr().err == ""
+
+
+def test_batch_target_orders_preserve_mapping_order_and_market_rules(
+    data_root: Path,
+) -> None:
+    def initialize(context):
+        context.first = symbol("000001.SZ")
+        context.second = symbol("688001.SH")
+        context.day = 0
+        context.submitted = []
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            context.submitted = order_target_many(
+                {context.second: 200, context.first: 100}
+            )
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=100_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    assert result.orders["ts_code"].tolist() == ["688001.SH", "000001.SZ"]
+    assert result.orders["amount"].tolist() == [200.0, 100.0]
+    assert result.orders["status"].tolist() == ["filled", "filled"]
+    assert result.transactions["ts_code"].tolist() == ["688001.SH", "000001.SZ"]
+
+
+def test_batch_target_uses_d1_cash_for_partial_fill(data_root: Path) -> None:
+    def initialize(context):
+        context.asset = symbol("000001.SZ")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            order_target_many({context.asset: 200})
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=2_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["amount"] == 200.0
+    assert order_row["filled"] == 100.0
+    assert order_row["status"] == "partially_filled"
+    assert order_row["reject_reason"] == ""
+    assert result.transactions.iloc[0]["price"] == 10.5
+
+
+def test_batch_target_cancels_when_minimum_lot_is_unaffordable(
+    data_root: Path,
+) -> None:
+    def initialize(context):
+        context.asset = symbol("000001.SZ")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            order_target_many({context.asset: 100})
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=1_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["filled"] == 0.0
+    assert order_row["status"] == "canceled"
+    assert order_row["reject_reason"] == ""
+    assert "实际现金不足" in order_row["message"]
+    assert result.transactions.empty
+
+
+@pytest.mark.parametrize("target_api", ["value", "percent"])
+def test_single_value_targets_use_d1_cash_for_partial_fill(
+    data_root: Path, target_api: str
+) -> None:
+    def initialize(context):
+        context.asset = symbol("000001.SZ")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day != 1:
+            return
+        if target_api == "value":
+            order_target_value(context.asset, 2_000)
+        else:
+            order_target_percent(context.asset, 1.0)
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=2_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["amount"] == 200.0
+    assert order_row["filled"] == 100.0
+    assert order_row["status"] == "partially_filled"
+    assert order_row["reject_reason"] == ""
+
+
+def test_single_target_value_cancels_when_minimum_lot_is_unaffordable(
+    data_root: Path,
+) -> None:
+    def initialize(context):
+        context.asset = symbol("000001.SZ")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            order_target_value(context.asset, 1_000)
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=1_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["status"] == "canceled"
+    assert order_row["reject_reason"] == ""
+    assert result.transactions.empty
+
+
+def test_plain_quantity_order_keeps_insufficient_cash_rejection(
+    data_root: Path,
+) -> None:
+    initialize, handle_data = _single_order_strategy("000001.SZ")
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=1_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["status"] == "rejected"
+    assert order_row["reject_reason"] == "insufficient_cash"
+
+
+def test_plain_target_quantity_keeps_insufficient_cash_rejection(
+    data_root: Path,
+) -> None:
+    def initialize(context):
+        context.asset = symbol("000001.SZ")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            order_target(context.asset, 100)
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=1_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    order_row = result.orders.iloc[0]
+    assert order_row["status"] == "rejected"
+    assert order_row["reject_reason"] == "insufficient_cash"
+
+
+def test_batch_target_position_limit_cancels_only_excess_new_assets(
+    data_root: Path,
+) -> None:
+    def initialize(context):
+        context.first = symbol("000001.SZ")
+        context.second = symbol("688001.SH")
+        context.day = 0
+
+    def handle_data(context, data):
+        context.day += 1
+        if context.day == 1:
+            order_target_many(
+                {context.second: 200, context.first: 100}, position_limit=1
+            )
+
+    result = run_algorithm(
+        start="2024-01-02",
+        end="2024-01-03",
+        initialize=initialize,
+        handle_data=handle_data,
+        capital_base=100_000,
+        bundle_root=data_root,
+        execution_time="open",
+        generate_report=False,
+        show_progress=False,
+    )
+
+    assert result.orders["status"].tolist() == ["filled", "canceled"]
+    assert result.orders["reject_reason"].tolist() == ["", ""]
+    assert result.transactions["ts_code"].tolist() == ["688001.SH"]
+    assert result.metrics["open_positions"] == 1
 
 
 def test_open_and_close_execution_check_only_selected_endpoint(data_root: Path) -> None:
@@ -300,8 +548,9 @@ def test_report_and_daily_positions_are_exported(
     assert "费用与交易限制 (Fees & Trading Constraints)" in report
     assert "组合归因 (Attribution)" in report
     assert "<th>持有总天数</th>" in report
-    assert "<th>几何贡献收益</th>" in report
-    assert "1.05×0.97-1=1.85%" in report
+    assert "<th>几何贡献收益（每日权重贡献累计）</th>" in report
+    assert "贡献收益按每日结算持仓逐项计算" not in report
+    assert "1%×30%−1%×10%=0.20%" not in report
     assert "<tr><td>000001.SZ</td><td>2</td><td>1</td>" in report
     assert "plotly" in report.lower()
     assert result.positions_path.read_bytes().startswith(b"\xef\xbb\xbf")
@@ -309,6 +558,27 @@ def test_report_and_daily_positions_are_exported(
     assert set(positions["date"]) == set(
         pd.date_range("2024-01-02", "2024-01-08", freq="B").strftime("%Y-%m-%d")
     )
-    assert {"quantity", "sellable_quantity", "raw_close", "adjusted_close"}.issubset(
-        positions.columns
+    assert {
+        "quantity",
+        "sellable_quantity",
+        "raw_close",
+        "adjusted_close",
+        "asset_return",
+    }.issubset(positions.columns)
+    cash_dates = set(
+        positions.loc[
+            positions["record_type"].eq("CASH")
+            & pd.to_numeric(positions["market_value"], errors="coerce").gt(0),
+            "date",
+        ]
     )
+    invested_dates = set(
+        positions.loc[
+            positions["record_type"].eq("POSITION")
+            & pd.to_numeric(positions["market_value"], errors="coerce").gt(0),
+            "date",
+        ]
+    )
+    cash_only_days = len(cash_dates - invested_dates)
+    assert cash_only_days < len(cash_dates)
+    assert f"<tr><td>CASH</td><td>0</td><td>{cash_only_days}</td>" in report

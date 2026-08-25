@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Self
@@ -15,7 +17,9 @@ import pandas as pd
 
 from ._hdf5_store import (
     HDF5_FILES,
+    PACKED_LAYOUT,
     date_to_int,
+    dates_to_int,
     load_assets_manifest,
     open_h5_checked,
 )
@@ -53,7 +57,31 @@ _EXTENDED_DAILY_NAMESPACES = frozenset(
 _FINANCIAL_NAMESPACES = frozenset(
     {"balancesheet", "income", "cashflow", "fina_indicator"}
 )
-_COLUMN_CACHE_MAX_BYTES = 1024 * 1024**2
+_DEFAULT_COLUMN_CACHE_MIB = 2048
+_QUERY_PLAN_CACHE_SIZE = 128
+_INDEX_FRAME_CACHE_SIZE = 128
+
+
+def _default_column_cache_bytes() -> int:
+    raw = os.environ.get("TUALPHA_COLUMN_CACHE_MIB", str(_DEFAULT_COLUMN_CACHE_MIB))
+    try:
+        mib = int(raw)
+    except ValueError as exc:
+        raise DataError("TUALPHA_COLUMN_CACHE_MIB must be an integer") from exc
+    if mib < 0:
+        raise DataError("TUALPHA_COLUMN_CACHE_MIB must not be negative")
+    return mib * 1024**2
+
+
+@dataclass(slots=True)
+class _AssetQueryPlan:
+    sids: np.ndarray
+    first: np.ndarray
+    last: np.ndarray
+    offsets: np.ndarray
+    list_dates: np.ndarray
+    delist_dates: np.ndarray
+
 
 _BASE_STORAGE = {
     "open": ("daily", "open"),
@@ -105,6 +133,8 @@ class BundleDataPortal:
         adjustment: AdjustmentMode | str,
         backtest_end: str | pd.Timestamp,
         bundle_name: str = BUNDLE_NAME,
+        *,
+        column_cache_max_bytes: int | None = None,
     ) -> None:
         from .data import DailyBar
 
@@ -114,6 +144,13 @@ class BundleDataPortal:
         self.calendar = calendar
         self.adjustment = AdjustmentMode(adjustment)
         self.backtest_end = normalize_session(backtest_end)
+        self._column_cache_max_bytes = (
+            _default_column_cache_bytes()
+            if column_cache_max_bytes is None
+            else int(column_cache_max_bytes)
+        )
+        if self._column_cache_max_bytes < 0:
+            raise ValueError("column_cache_max_bytes must not be negative")
         self._bundle_lock_key, self._bundle_lock = acquire_bundle_read_lock(
             self.bundle_root, bundle_name
         )
@@ -151,6 +188,13 @@ class BundleDataPortal:
             self._initialize_row_metadata()
             self._column_cache: OrderedDict[str, np.ndarray] = OrderedDict()
             self._column_cache_bytes = 0
+            self._query_plans: OrderedDict[tuple[int, ...], _AssetQueryPlan] = (
+                OrderedDict()
+            )
+            self._index_arrays: dict[str, np.ndarray] = {}
+            self._index_frames: OrderedDict[tuple[str, int], pd.DataFrame] = (
+                OrderedDict()
+            )
             self._bar_presence: np.ndarray | None = None
             self._daily_fields = self._load_daily_fields()
             self._financial_fields = self._load_financial_fields()
@@ -326,36 +370,99 @@ class BundleDataPortal:
             return None
         return row
 
+    def _query_plan(self, assets: Sequence[Asset]) -> _AssetQueryPlan:
+        key = tuple(asset.sid for asset in assets)
+        cached = self._query_plans.get(key)
+        if cached is not None:
+            self._query_plans.move_to_end(key)
+            return cached
+
+        sids = np.asarray(key, dtype=np.int64)
+        known = (sids >= 0) & (sids < len(self._first_row_by_sid))
+        first = np.full(len(sids), -1, dtype=np.int64)
+        last = np.full(len(sids), -1, dtype=np.int64)
+        offsets = np.full(len(sids), -1, dtype=np.int64)
+        list_dates = np.full(len(sids), np.iinfo(np.int64).min, dtype=np.int64)
+        delist_dates = np.full(len(sids), np.iinfo(np.int64).max, dtype=np.int64)
+        first[known] = self._first_row_by_sid[sids[known]]
+        last[known] = self._last_row_by_sid[sids[known]]
+        offsets[known] = self._calendar_offset_by_sid[sids[known]]
+        list_dates[known] = self._list_date_by_sid[sids[known]]
+        delist_dates[known] = self._delist_date_by_sid[sids[known]]
+        for values in (sids, first, last, offsets, list_dates, delist_dates):
+            values.setflags(write=False)
+        plan = _AssetQueryPlan(
+            sids=sids,
+            first=first,
+            last=last,
+            offsets=offsets,
+            list_dates=list_dates,
+            delist_dates=delist_dates,
+        )
+        self._query_plans[key] = plan
+        self._query_plans.move_to_end(key)
+        while len(self._query_plans) > _QUERY_PLAN_CACHE_SIZE:
+            self._query_plans.popitem(last=False)
+        return plan
+
     def _row_indices(
         self,
         assets: Sequence[Asset],
         session: str | pd.Timestamp,
     ) -> tuple[pd.Timestamp, np.ndarray, np.ndarray, np.ndarray]:
         date = normalize_session(session)
-        rows = np.full(len(assets), -1, dtype=np.int64)
-        if not assets:
+        plan = self._query_plan(assets)
+        if not len(plan.sids):
+            rows = np.empty(0, dtype=np.int64)
             empty = np.zeros(0, dtype=bool)
             return date, rows, empty, empty
-        sids = np.fromiter((asset.sid for asset in assets), dtype=np.int64)
-        known = (sids >= 0) & (sids < len(self._first_row_by_sid))
-        first = np.full(len(assets), -1, dtype=np.int64)
-        last = np.full(len(assets), -1, dtype=np.int64)
-        offsets = np.full(len(assets), -1, dtype=np.int64)
-        list_dates = np.full(len(assets), np.iinfo(np.int64).min, dtype=np.int64)
-        delist_dates = np.full(len(assets), np.iinfo(np.int64).max, dtype=np.int64)
-        first[known] = self._first_row_by_sid[sids[known]]
-        last[known] = self._last_row_by_sid[sids[known]]
-        offsets[known] = self._calendar_offset_by_sid[sids[known]]
-        list_dates[known] = self._list_date_by_sid[sids[known]]
-        delist_dates[known] = self._delist_date_by_sid[sids[known]]
-        alive = (list_dates <= date.value) & (date.value <= delist_dates)
+        alive = (plan.list_dates <= date.value) & (date.value <= plan.delist_dates)
         day_location = self._session_location(date_to_int(date))
         if day_location is None:
-            return date, rows, np.zeros(len(assets), dtype=bool), alive
-        rows = first + day_location - offsets
-        valid = alive & (first >= 0) & (offsets >= 0) & (rows >= first) & (rows <= last)
+            rows = np.full(len(plan.sids), -1, dtype=np.int64)
+            return date, rows, np.zeros(len(plan.sids), dtype=bool), alive
+        rows = plan.first + day_location - plan.offsets
+        valid = (
+            alive
+            & (plan.first >= 0)
+            & (plan.offsets >= 0)
+            & (rows >= plan.first)
+            & (rows <= plan.last)
+        )
+        rows = np.asarray(rows, dtype=np.int64)
         rows[~valid] = -1
         return date, rows, valid, alive
+
+    def _row_matrix(
+        self,
+        assets: Sequence[Asset],
+        sessions: pd.DatetimeIndex,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        plan = self._query_plan(assets)
+        shape = (len(sessions), len(plan.sids))
+        if not shape[0] or not shape[1]:
+            return (
+                np.full(shape, -1, dtype=np.int64),
+                np.zeros(shape, dtype=bool),
+                np.zeros(shape, dtype=bool),
+            )
+        locations = self.calendar.sessions.get_indexer(sessions).astype(np.int64)
+        session_values = sessions.asi8[:, None]
+        alive = (plan.list_dates[None, :] <= session_values) & (
+            session_values <= plan.delist_dates[None, :]
+        )
+        rows = plan.first[None, :] + locations[:, None] - plan.offsets[None, :]
+        valid = (
+            alive
+            & (locations[:, None] >= 0)
+            & (plan.first[None, :] >= 0)
+            & (plan.offsets[None, :] >= 0)
+            & (rows >= plan.first[None, :])
+            & (rows <= plan.last[None, :])
+        )
+        rows = np.asarray(rows, dtype=np.int64)
+        rows[~valid] = -1
+        return rows, valid, alive
 
     def _full_column(self, role: str, field: str) -> np.ndarray:
         key = f"{role}.{field}"
@@ -363,39 +470,50 @@ class BundleDataPortal:
         if cached is not None:
             self._column_cache.move_to_end(key)
             return cached
-        group = self._h5[role]["data"]
-        dtype: np.dtype[Any] | None = None
-        for asset in self._ordered_assets:
-            if asset.ts_code in group:
-                dtype = group[asset.ts_code].dtype[field]
-                break
-        if dtype is None:
-            return np.array([], dtype=float)
-        values = np.empty(self._packed_row_count, dtype=dtype)
-        if dtype.kind == "f":
-            values.fill(np.nan)
-        elif dtype.kind == "i":
-            values.fill(-1)
+        handle = self._h5[role]
+        packed = handle.get("packed")
+        if isinstance(packed, h5py.Group) and field in packed:
+            if str(packed.attrs.get("layout", "")) != PACKED_LAYOUT:
+                raise DataError(f"packed layout is invalid in {role}.h5")
+            dataset = packed[field]
+            if len(dataset) != self._packed_row_count:
+                raise DataError(f"packed rows do not align in {role}.h5: {field}")
+            values = np.asarray(dataset[:])
         else:
-            values.fill(0)
-        for asset in self._ordered_assets:
-            target = self._packed_slices.get(asset.sid)
-            if target is None:
-                continue
-            dataset = group.get(asset.ts_code)
-            if dataset is None or field not in (dataset.dtype.names or ()):
-                continue
-            source = _field_array(dataset, field)
-            if len(source) != target.stop - target.start:
-                raise DataError(
-                    f"{role}.h5 rows do not align with daily.h5 for {asset.ts_code}"
-                )
-            values[target] = source
+            group = handle["data"]
+            dtype: np.dtype[Any] | None = None
+            for asset in self._ordered_assets:
+                if asset.ts_code in group:
+                    dtype = group[asset.ts_code].dtype[field]
+                    break
+            if dtype is None:
+                return np.array([], dtype=float)
+            values = np.empty(self._packed_row_count, dtype=dtype)
+            if dtype.kind == "f":
+                values.fill(np.nan)
+            elif dtype.kind == "i":
+                values.fill(-1)
+            else:
+                values.fill(0)
+            for asset in self._ordered_assets:
+                target = self._packed_slices.get(asset.sid)
+                if target is None:
+                    continue
+                dataset = group.get(asset.ts_code)
+                if dataset is None or field not in (dataset.dtype.names or ()):
+                    continue
+                source = _field_array(dataset, field)
+                if len(source) != target.stop - target.start:
+                    raise DataError(
+                        f"{role}.h5 rows do not align with daily.h5 for {asset.ts_code}"
+                    )
+                values[target] = source
         values.setflags(write=False)
-        if values.nbytes <= _COLUMN_CACHE_MAX_BYTES:
+        if values.nbytes <= self._column_cache_max_bytes:
             while (
                 self._column_cache
-                and self._column_cache_bytes + values.nbytes > _COLUMN_CACHE_MAX_BYTES
+                and self._column_cache_bytes + values.nbytes
+                > self._column_cache_max_bytes
             ):
                 _, evicted = self._column_cache.popitem(last=False)
                 self._column_cache_bytes -= evicted.nbytes
@@ -629,6 +747,18 @@ class BundleDataPortal:
     ) -> dict[str, np.ndarray]:
         asset_list = list(assets)
         date, rows, valid, alive = self._row_indices(asset_list, session)
+        needs_adjustment = adjusted and not (
+            self.adjustment is AdjustmentMode.RAW
+            or (self.adjustment is AdjustmentMode.QFQ and reference_session is None)
+        )
+        multipliers: np.ndarray | None = None
+        if needs_adjustment and any(
+            field in _ADJUSTED_PRICE_FIELDS for field in fields
+        ):
+            reference = date if reference_session is None else reference_session
+            multipliers = self._adjustment_matrix(
+                asset_list, pd.DatetimeIndex([date]), reference
+            )[0]
         output: dict[str, np.ndarray] = {}
         for field in fields:
             if "." in field:
@@ -667,22 +797,42 @@ class BundleDataPortal:
                 if field in {"volume", "turnover"}:
                     decoded = np.maximum(decoded, 0.0)
                 values[positions] = decoded
-                if adjusted and field in _ADJUSTED_PRICE_FIELDS:
-                    multipliers = np.fromiter(
-                        (
-                            self.adjustment_multiplier(
-                                asset,
-                                date,
-                                reference_session=reference_session,
-                            )
-                            for asset in asset_list
-                        ),
-                        dtype=float,
-                        count=len(asset_list),
-                    )
+                if multipliers is not None and field in _ADJUSTED_PRICE_FIELDS:
                     values[positions] *= multipliers[positions]
             output[field] = values
         return output
+
+    def _adjustment_matrix(
+        self,
+        assets: Sequence[Asset],
+        sessions: pd.DatetimeIndex,
+        reference_session: str | pd.Timestamp,
+    ) -> np.ndarray:
+        multipliers = np.ones((len(sessions), len(assets)), dtype=float)
+        if self.adjustment is AdjustmentMode.RAW or not len(sessions):
+            return multipliers
+        session_dates = dates_to_int(sessions)
+        reference = date_to_int(reference_session)
+        for asset_index, asset in enumerate(assets):
+            factor_dates, factor_values = self._factor_series(asset.sid)
+            if not len(factor_dates):
+                continue
+            indices = np.searchsorted(factor_dates, session_dates, side="right") - 1
+            visible = indices >= 0
+            factors = np.ones(len(sessions), dtype=float)
+            factors[visible] = factor_values[indices[visible]]
+            if self.adjustment is AdjustmentMode.HFQ:
+                multipliers[:, asset_index] = factors
+                continue
+            reference_index = (
+                int(np.searchsorted(factor_dates, reference, side="right")) - 1
+            )
+            reference_factor = (
+                float(factor_values[reference_index]) if reference_index >= 0 else 1.0
+            )
+            if reference_factor:
+                multipliers[:, asset_index] = factors / reference_factor
+        return multipliers
 
     def history(
         self,
@@ -693,41 +843,77 @@ class BundleDataPortal:
         *,
         adjusted: bool = True,
     ) -> pd.DataFrame:
+        asset_list = list(assets)
+        field_list = list(fields)
         sessions = self.calendar.window(end_session, bar_count, include_end=True)
+        rows, valid, alive = self._row_matrix(asset_list, sessions)
         extended = {
-            field: self._extended_daily_spec(field) for field in fields if "." in field
+            field: self._extended_daily_spec(field)
+            for field in field_list
+            if "." in field
         }
-        columns = pd.MultiIndex.from_product(
-            [[asset.ts_code for asset in assets], list(fields)],
-            names=["asset", "field"],
-        )
         has_strings = any(
             spec is not None and spec["kind"] == "categorical"
             for spec in extended.values()
+        )
+        adjustments = (
+            self._adjustment_matrix(asset_list, sessions, end_session)
+            if adjusted and any(field in _ADJUSTED_PRICE_FIELDS for field in field_list)
+            else None
+        )
+        matrices: dict[str, np.ndarray] = {}
+        for field in field_list:
+            spec = extended.get(field)
+            if spec is not None:
+                if spec["kind"] == "categorical":
+                    values = np.full(rows.shape, None, dtype=object)
+                elif field == "stock_st.is_st":
+                    values = np.zeros(rows.shape, dtype=float)
+                    values[~alive] = np.nan
+                else:
+                    values = np.full(rows.shape, np.nan, dtype=float)
+                if valid.any():
+                    raw = self._full_column(spec["role"], spec["column"])[rows[valid]]
+                    if spec["kind"] == "categorical":
+                        categories = spec["categories"]
+                        values[valid] = [
+                            categories[int(value)]
+                            if 0 <= int(value) < len(categories)
+                            else None
+                            for value in raw
+                        ]
+                    else:
+                        values[valid] = np.asarray(raw, dtype=float)
+                matrices[field] = values
+                continue
+            if field not in _BASE_FIELDS:
+                raise KeyError(f"unknown daily bar field: {field}")
+            values = np.full(rows.shape, np.nan, dtype=float)
+            if valid.any():
+                role, column = _BASE_STORAGE[field]
+                decoded = self._full_column(role, column)[rows[valid]].astype(float)
+                if field in {"volume", "turnover"}:
+                    decoded = np.maximum(decoded, 0.0)
+                values[valid] = decoded
+                if adjustments is not None and field in _ADJUSTED_PRICE_FIELDS:
+                    values[valid] *= adjustments[valid]
+            matrices[field] = values
+
+        columns = pd.MultiIndex.from_product(
+            [[asset.ts_code for asset in asset_list], field_list],
+            names=["asset", "field"],
         )
         result = pd.DataFrame(
             index=sessions,
             columns=columns,
             dtype=object if has_strings else float,
         )
-        for field in fields:
-            matrices: list[np.ndarray] = []
-            for session in sessions:
-                matrices.append(
-                    self.values(
-                        assets,
-                        session,
-                        [field],
-                        adjusted=adjusted,
-                        reference_session=end_session,
-                    )[field]
-                )
-            matrix = np.asarray(matrices, dtype=object if has_strings else float)
-            for asset_index, asset in enumerate(assets):
+        for field, matrix in matrices.items():
+            for asset_index, asset in enumerate(asset_list):
                 result[(asset.ts_code, field)] = matrix[:, asset_index]
         if has_strings:
-            for asset in assets:
-                for field in fields:
+            for asset in asset_list:
+                for field in field_list:
                     spec = extended.get(field)
                     if spec is None or spec["kind"] != "categorical":
                         result[(asset.ts_code, field)] = pd.to_numeric(
@@ -860,20 +1046,29 @@ class BundleDataPortal:
             .reindex(columns=names)
         )
 
+    def _index_values(self, code: str) -> np.ndarray:
+        cached = self._index_arrays.get(code)
+        if cached is not None:
+            return cached
+        group = self._h5["index_weight"]["data"]
+        if code not in group:
+            raise KeyError(f"index constituents are unavailable for {code!r}")
+        values = np.asarray(group[code][:])
+        values.setflags(write=False)
+        self._index_arrays[code] = values
+        return values
+
     @lru_cache(maxsize=32_768)  # noqa: B019
     def _index_rows(
         self, index_code: str, session_int: int
     ) -> tuple[tuple[str, int | None, float, int], ...]:
         code = index_code.upper().strip()
-        group = self._h5["index_weight"]["data"]
-        if code not in group:
-            raise KeyError(f"index constituents are unavailable for {code!r}")
-        values = np.asarray(group[code][:])
+        values = self._index_values(code)
         dates = values["snapshot_date"]
-        eligible = dates < session_int
-        if not eligible.any():
+        position = int(np.searchsorted(dates, session_int, side="left") - 1)
+        if position < 0:
             return ()
-        snapshot = int(dates[eligible].max())
+        snapshot = int(dates[position])
         selected = values[dates == snapshot]
         return tuple(
             (
@@ -893,23 +1088,7 @@ class BundleDataPortal:
             raise DataError("index constituent query cannot exceed backtest end")
         code = index_code.upper().strip()
         rows = self._index_rows(code, date_to_int(date))
-        result_rows = []
-        for con_code, sid, weight, snapshot in rows:
-            asset = None
-            if sid is not None:
-                try:
-                    asset = self.asset_finder.retrieve_asset(sid)
-                except LookupError:
-                    pass
-            result_rows.append(
-                {
-                    "ts_code": con_code,
-                    "asset": asset,
-                    "weight": weight,
-                    "snapshot_date": pd.to_datetime(str(snapshot), format="%Y%m%d"),
-                }
-            )
-        if not result_rows:
+        if not rows:
             empty = pd.DataFrame(
                 {
                     "asset": pd.Series(dtype=object),
@@ -920,15 +1099,45 @@ class BundleDataPortal:
             )
             empty.attrs["index_code"] = code
             return empty
-        frame = pd.DataFrame(result_rows).set_index("ts_code")
-        frame.attrs.update(
-            {
-                "index_code": code,
-                "snapshot_date": frame["snapshot_date"].iloc[0],
-                "weight_unit": "percent",
-            }
-        )
-        return frame[["asset", "weight", "snapshot_date"]]
+
+        snapshot = rows[0][3]
+        cache_key = (code, snapshot)
+        cached = self._index_frames.get(cache_key)
+        if cached is None:
+            result_rows = []
+            for con_code, sid, weight, _ in rows:
+                asset = None
+                if sid is not None:
+                    try:
+                        asset = self.asset_finder.retrieve_asset(sid)
+                    except LookupError:
+                        pass
+                result_rows.append(
+                    {
+                        "ts_code": con_code,
+                        "asset": asset,
+                        "weight": weight,
+                        "snapshot_date": pd.to_datetime(str(snapshot), format="%Y%m%d"),
+                    }
+                )
+            cached = pd.DataFrame(result_rows).set_index("ts_code")
+            cached.attrs.update(
+                {
+                    "index_code": code,
+                    "snapshot_date": cached["snapshot_date"].iloc[0],
+                    "weight_unit": "percent",
+                }
+            )
+            cached = cached[["asset", "weight", "snapshot_date"]]
+            self._index_frames[cache_key] = cached
+            self._index_frames.move_to_end(cache_key)
+            while len(self._index_frames) > _INDEX_FRAME_CACHE_SIZE:
+                self._index_frames.popitem(last=False)
+        else:
+            self._index_frames.move_to_end(cache_key)
+        result = cached.copy(deep=True)
+        result.attrs = dict(cached.attrs)
+        return result
 
     def benchmark_returns(self, code: str, sessions: pd.DatetimeIndex) -> pd.Series:
         key = code.upper().strip()
@@ -963,4 +1172,10 @@ class BundleDataPortal:
         if getattr(self, "_column_cache", None) is not None:
             self._column_cache.clear()
             self._column_cache_bytes = 0
+        if getattr(self, "_query_plans", None) is not None:
+            self._query_plans.clear()
+        if getattr(self, "_index_arrays", None) is not None:
+            self._index_arrays.clear()
+        if getattr(self, "_index_frames", None) is not None:
+            self._index_frames.clear()
         self._bar_presence = None

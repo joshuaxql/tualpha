@@ -65,6 +65,7 @@ class BacktestConfig:
     plotly_js: PlotlyJsMode | str = PlotlyJsMode.INLINE
     annualization_factor: int = 252
     bundle_name: str = "tualpha"
+    column_cache_mib: int | None = None
 
     def __post_init__(self) -> None:
         self.start = normalize_session(self.start)
@@ -86,3 +87,5 @@ class BacktestConfig:
             raise ConfigurationError("annualization_factor must be positive")
         if not self.bundle_name.strip():
             raise ConfigurationError("bundle_name must not be empty")
+        if self.column_cache_mib is not None and self.column_cache_mib < 0:
+            raise ConfigurationError("column_cache_mib must not be negative")

@@ -56,12 +56,15 @@ class SimulationBroker:
             FeeBreakdown
         )
 
-    def submit(
+    def _append_order(
         self,
         asset: Asset,
         amount: float,
         created_session: pd.Timestamp,
         eligible_session: pd.Timestamp,
+        *,
+        position_limit: int | None = None,
+        cash_adaptive: bool = False,
     ) -> Order:
         numeric_amount = float(amount)
         order = Order(
@@ -69,6 +72,8 @@ class SimulationBroker:
             amount=numeric_amount,
             created_session=created_session,
             eligible_session=eligible_session,
+            position_limit=position_limit,
+            cash_adaptive=cash_adaptive,
         )
         if not math.isfinite(numeric_amount):
             order.reject(RejectReason.INVALID_LOT, "委托数量必须为有限数值")
@@ -78,6 +83,46 @@ class SimulationBroker:
         if order.open:
             self._open_orders[order.id] = order
         return order
+
+    def submit(
+        self,
+        asset: Asset,
+        amount: float,
+        created_session: pd.Timestamp,
+        eligible_session: pd.Timestamp,
+        *,
+        cash_adaptive: bool = False,
+    ) -> Order:
+        return self._append_order(
+            asset,
+            amount,
+            created_session,
+            eligible_session,
+            cash_adaptive=cash_adaptive,
+        )
+
+    def submit_many(
+        self,
+        orders: Iterable[tuple[Asset, float]],
+        created_session: pd.Timestamp,
+        eligible_session: pd.Timestamp,
+        position_limit: int | None = None,
+        cash_adaptive: bool = False,
+    ) -> list[Order]:
+        """Append a mapping-ordered batch without repeating session resolution."""
+
+        append = self._append_order
+        return [
+            append(
+                asset,
+                amount,
+                created_session,
+                eligible_session,
+                position_limit=position_limit,
+                cash_adaptive=cash_adaptive,
+            )
+            for asset, amount in orders
+        ]
 
     def cancel(self, order: Order) -> None:
         if order.open:
@@ -165,6 +210,14 @@ class SimulationBroker:
             session,
             self.execution_field,
         )
+        active_position_count = sum(
+            1
+            for asset, position in self.portfolio.positions.items()
+            if position.amount > _EPSILON
+            and position.last_sale_price > 0
+            and asset.is_alive_on(session)
+        )
+        settle_session: pd.Timestamp | None = None
         for order in eligible:
             asset = order.asset
             if not asset.is_alive_on(session):
@@ -201,13 +254,27 @@ class SimulationBroker:
                 continue
 
             if order.is_buy:
+                opens_new_position = position is None or position_amount <= _EPSILON
+                if (
+                    opens_new_position
+                    and order.position_limit is not None
+                    and active_position_count >= order.position_limit
+                ):
+                    order.status = OrderStatus.CANCELED
+                    order.message = "组合已达到批量订单的持仓标的上限"
+                    continue
                 quantity = self._affordable_buy_quantity(
                     asset, requested, price, session
                 )
                 if quantity <= 0:
-                    order.reject(
-                        RejectReason.INSUFFICIENT_CASH, "可用现金不足以完成最小交易单位"
-                    )
+                    if order.cash_adaptive:
+                        order.status = OrderStatus.CANCELED
+                        order.message = "D+1实际现金不足以完成最小交易单位，目标单取消"
+                    else:
+                        order.reject(
+                            RejectReason.INSUFFICIENT_CASH,
+                            "可用现金不足以完成最小交易单位",
+                        )
                     continue
                 fees = self.fee_model.calculate(
                     asset, quantity * price, is_sell=False, session=session
@@ -220,7 +287,14 @@ class SimulationBroker:
                     session=session,
                     fees=fees,
                 )
-                self._apply_buy(transaction)
+                if settle_session is None:
+                    try:
+                        settle_session = self.calendar.next_session(session)
+                    except DataError:
+                        settle_session = session + pd.Timedelta(days=1)
+                self._apply_buy(transaction, settle_session)
+                if opens_new_position:
+                    active_position_count += 1
             else:
                 quantity = requested
                 if position is None or position_amount + _EPSILON < quantity:
@@ -246,6 +320,8 @@ class SimulationBroker:
                     fees=fees,
                 )
                 self._apply_sell(transaction)
+                if asset not in self.portfolio.positions:
+                    active_position_count = max(0, active_position_count - 1)
 
             self.transactions.append(transaction)
             self._fees_by_session[session] = (
@@ -266,16 +342,13 @@ class SimulationBroker:
                 self._open_orders.pop(order.id, None)
         return fills
 
-    def _apply_buy(self, transaction: Transaction) -> None:
+    def _apply_buy(
+        self, transaction: Transaction, settle_session: pd.Timestamp
+    ) -> None:
         asset = transaction.asset
         quantity = transaction.amount
         self.portfolio.cash += transaction.cash_flow
         position = self.portfolio.positions.setdefault(asset, Position(asset=asset))
-        try:
-            settle_session = self.calendar.next_session(transaction.session)
-        except DataError:
-            # The final available data session can still hold an unsettled lot.
-            settle_session = transaction.session + pd.Timedelta(days=1)
         unit_cost = (transaction.gross_value + transaction.fees.total) / quantity
         position.add_lot(
             quantity=quantity,

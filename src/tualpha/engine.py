@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,25 @@ from .rules import ChinaMarketRules
 Initialize = Callable[[Any], None]
 HandleData = Callable[[Any, BarData], None]
 Analyze = Callable[[Any, BacktestResult], None]
+
+_POSITION_COLUMNS = (
+    "date",
+    "record_type",
+    "ts_code",
+    "name",
+    "asset_type",
+    "quantity",
+    "sellable_quantity",
+    "cost_basis",
+    "raw_close",
+    "adjusted_close",
+    "asset_return",
+    "market_value",
+    "weight",
+    "unrealized_pnl",
+    "cash",
+    "portfolio_value",
+)
 
 
 class AlgorithmContext:
@@ -90,6 +109,11 @@ class TradingAlgorithm:
                 config.adjustment,
                 config.end,
                 config.bundle_name,
+                column_cache_max_bytes=(
+                    None
+                    if config.column_cache_mib is None
+                    else config.column_cache_mib * 1024**2
+                ),
             )
         finally:
             release_bundle_read_lock(initialization_lock)
@@ -110,7 +134,9 @@ class TradingAlgorithm:
         self._current_records: dict[str, Any] = {}
         self._record_rows: list[dict[str, Any]] = []
         self._performance_rows: list[dict[str, Any]] = []
-        self._position_rows: list[dict[str, Any]] = []
+        self._position_columns: dict[str, list[Any]] = {
+            column: [] for column in _POSITION_COLUMNS
+        }
 
     @property
     def portfolio_value(self) -> float:
@@ -132,7 +158,13 @@ class TradingAlgorithm:
         except DataError:
             return session + pd.Timedelta(days=1)
 
-    def submit_order(self, asset: Asset | str, amount: float) -> Order:
+    def submit_order(
+        self,
+        asset: Asset | str,
+        amount: float,
+        *,
+        cash_adaptive: bool = False,
+    ) -> Order:
         session = self._require_order_phase()
         resolved = self.resolve_asset(asset)
         return self.broker.submit(
@@ -140,6 +172,7 @@ class TradingAlgorithm:
             amount,
             created_session=session,
             eligible_session=self._next_eligible_session(session),
+            cash_adaptive=cash_adaptive,
         )
 
     def _raw_close(self, asset: Asset) -> float:
@@ -164,7 +197,13 @@ class TradingAlgorithm:
             )
         return self.submit_order(resolved, amount) if abs(amount) > 1e-12 else None
 
-    def submit_order_target(self, asset: Asset | str, target: float) -> Order | None:
+    def submit_order_target(
+        self,
+        asset: Asset | str,
+        target: float,
+        *,
+        cash_adaptive: bool = False,
+    ) -> Order | None:
         self._require_order_phase()
         if target < 0:
             raise ValueError("negative target quantities would create a short position")
@@ -179,7 +218,51 @@ class TradingAlgorithm:
             amount = -self.market_rules.normalize_sell(
                 resolved, abs(difference), current
             )
-        return self.submit_order(resolved, amount) if abs(amount) > 1e-12 else None
+        return (
+            self.submit_order(
+                resolved,
+                amount,
+                cash_adaptive=cash_adaptive,
+            )
+            if abs(amount) > 1e-12
+            else None
+        )
+
+    def submit_order_targets(
+        self,
+        targets: Mapping[Asset | str, float],
+        *,
+        position_limit: int | None = None,
+    ) -> list[Order]:
+        session = self._require_order_phase()
+        if position_limit is not None and position_limit <= 0:
+            raise ValueError("position_limit must be positive")
+        if any(target < 0 for target in targets.values()):
+            raise ValueError("negative target quantities would create a short position")
+        prepared: list[tuple[Asset, float]] = []
+        for asset, target in targets.items():
+            resolved = self.resolve_asset(asset)
+            current = self.portfolio.amount(resolved)
+            difference = float(target) - current
+            if abs(difference) <= 1e-9:
+                continue
+            if difference > 0:
+                amount = self.market_rules.normalize_buy(resolved, difference)
+            else:
+                amount = -self.market_rules.normalize_sell(
+                    resolved, abs(difference), current
+                )
+            if abs(amount) > 1e-12:
+                prepared.append((resolved, amount))
+        if not prepared:
+            return []
+        return self.broker.submit_many(
+            prepared,
+            created_session=session,
+            eligible_session=self._next_eligible_session(session),
+            position_limit=position_limit,
+            cash_adaptive=True,
+        )
 
     def submit_order_target_value(
         self, asset: Asset | str, target: float
@@ -191,7 +274,11 @@ class TradingAlgorithm:
         price = self._raw_close(resolved)
         if not np.isfinite(price) or price <= 0:
             return None
-        return self.submit_order_target(resolved, target / price)
+        return self.submit_order_target(
+            resolved,
+            target / price,
+            cash_adaptive=True,
+        )
 
     def cancel_order(self, order: Order) -> None:
         self.broker.cancel(order)
@@ -268,66 +355,121 @@ class TradingAlgorithm:
 
     def _capture_positions(self, session: pd.Timestamp) -> None:
         portfolio_value = self.portfolio.portfolio_value
-        self._position_rows.append(
-            {
-                "date": session,
-                "record_type": "CASH",
-                "ts_code": "CASH",
-                "name": "现金",
-                "asset_type": "cash",
-                "quantity": 0.0,
-                "sellable_quantity": 0.0,
-                "cost_basis": 1.0,
-                "raw_close": 1.0,
-                "adjusted_close": 1.0,
-                "market_value": self.portfolio.cash,
-                "weight": self.portfolio.cash / portfolio_value
-                if portfolio_value
-                else 0.0,
-                "unrealized_pnl": 0.0,
-                "cash": self.portfolio.cash,
-                "portfolio_value": portfolio_value,
-            }
-        )
+        cash = self.portfolio.cash
+        columns = self._position_columns
+        dates = columns["date"]
+        record_types = columns["record_type"]
+        codes = columns["ts_code"]
+        names = columns["name"]
+        asset_types = columns["asset_type"]
+        quantities = columns["quantity"]
+        sellable_quantities = columns["sellable_quantity"]
+        cost_bases = columns["cost_basis"]
+        raw_closes = columns["raw_close"]
+        adjusted_values = columns["adjusted_close"]
+        asset_returns = columns["asset_return"]
+        market_values = columns["market_value"]
+        weights = columns["weight"]
+        unrealized_values = columns["unrealized_pnl"]
+        cash_values = columns["cash"]
+        portfolio_values = columns["portfolio_value"]
+
+        dates.append(session)
+        record_types.append("CASH")
+        codes.append("CASH")
+        names.append("现金")
+        asset_types.append("cash")
+        quantities.append(0.0)
+        sellable_quantities.append(0.0)
+        cost_bases.append(1.0)
+        raw_closes.append(1.0)
+        adjusted_values.append(1.0)
+        asset_returns.append(0.0)
+        market_values.append(cash)
+        weights.append(cash / portfolio_value if portfolio_value else 0.0)
+        unrealized_values.append(0.0)
+        cash_values.append(cash)
+        portfolio_values.append(portfolio_value)
+
         position_items = list(self.broker.iter_positions())
+        if not position_items:
+            return
         position_assets = [asset for asset, _ in position_items]
-        adjusted_closes = self.data_portal.values(
+        positions = [position for _, position in position_items]
+        position_prices = self.data_portal.values(
             position_assets,
             session,
-            ["close"],
+            ["close", "pre_close"],
             adjusted=True,
             reference_session=self.config.end,
-        )["close"]
-        for (asset, position), adjusted_close in zip(
-            position_items, adjusted_closes, strict=True
-        ):
-            raw_close = position.last_sale_price
-            if asset.delist_date is not None and session > asset.delist_date:
-                raw_close = 0.0
-            # CSV export is produced after the run, so it uses a conventional
-            # end-normalized qfq series without exposing that denominator to callbacks.
-            market_value = position.amount * raw_close
-            self._position_rows.append(
-                {
-                    "date": session,
-                    "record_type": "POSITION",
-                    "ts_code": asset.ts_code,
-                    "name": asset.name,
-                    "asset_type": asset.asset_type.value,
-                    "quantity": position.amount,
-                    "sellable_quantity": position.sellable_amount(session),
-                    "cost_basis": position.cost_basis,
-                    "raw_close": raw_close,
-                    "adjusted_close": adjusted_close,
-                    "market_value": market_value,
-                    "weight": market_value / portfolio_value
-                    if portfolio_value
-                    else 0.0,
-                    "unrealized_pnl": market_value - position.total_cost,
-                    "cash": self.portfolio.cash,
-                    "portfolio_value": portfolio_value,
-                }
+        )
+        adjusted_closes = position_prices["close"]
+        pre_closes = position_prices["pre_close"]
+        # CSV export is produced after the run, so adjusted closes use a
+        # conventional end-normalized qfq denominator not exposed to callbacks.
+        amounts = np.fromiter(
+            (position.amount for position in positions),
+            dtype=float,
+            count=len(positions),
+        )
+        total_costs = np.fromiter(
+            (position.total_cost for position in positions),
+            dtype=float,
+            count=len(positions),
+        )
+        raw_prices = np.fromiter(
+            (
+                0.0
+                if asset.delist_date is not None and session > asset.delist_date
+                else position.last_sale_price
+                for asset, position in position_items
+            ),
+            dtype=float,
+            count=len(positions),
+        )
+        sellable = np.fromiter(
+            (position.sellable_amount(session) for position in positions),
+            dtype=float,
+            count=len(positions),
+        )
+        daily_returns = (
+            np.divide(
+                raw_prices,
+                pre_closes,
+                out=np.ones(len(positions), dtype=float),
+                where=np.isfinite(pre_closes) & (pre_closes > 0) & (raw_prices > 0),
             )
+            - 1.0
+        )
+        position_values = amounts * raw_prices
+        position_weights = (
+            position_values / portfolio_value
+            if portfolio_value
+            else np.zeros(len(positions), dtype=float)
+        )
+        bases = np.divide(
+            total_costs,
+            amounts,
+            out=np.zeros(len(positions), dtype=float),
+            where=amounts != 0,
+        )
+        count = len(positions)
+        dates.extend([session] * count)
+        record_types.extend(["POSITION"] * count)
+        codes.extend(asset.ts_code for asset in position_assets)
+        names.extend(asset.name for asset in position_assets)
+        asset_types.extend(asset.asset_type.value for asset in position_assets)
+        quantities.extend(amounts)
+        sellable_quantities.extend(sellable)
+        cost_bases.extend(bases)
+        raw_closes.extend(raw_prices)
+        adjusted_values.extend(adjusted_closes)
+        asset_returns.extend(daily_returns)
+        market_values.extend(position_values)
+        weights.extend(position_weights)
+        unrealized_values.extend(position_values - total_costs)
+        cash_values.extend([cash] * count)
+        portfolio_values.extend([portfolio_value] * count)
 
     @staticmethod
     def _orders_frame(orders: list[Order]) -> pd.DataFrame:
@@ -344,25 +486,25 @@ class TradingAlgorithm:
             "reject_reason",
             "message",
         ]
-        rows = [
+        return pd.DataFrame(
             {
-                "id": order.id,
-                "created_session": order.created_session,
-                "eligible_session": order.eligible_session,
-                "ts_code": order.asset.ts_code,
-                "asset_type": order.asset.asset_type.value,
-                "amount": order.amount,
-                "filled": order.filled,
-                "average_price": order.average_price,
-                "status": order.status.value,
-                "reject_reason": order.reject_reason.value
-                if order.reject_reason
-                else "",
-                "message": order.message,
-            }
-            for order in orders
-        ]
-        return pd.DataFrame(rows, columns=columns)
+                "id": [order.id for order in orders],
+                "created_session": [order.created_session for order in orders],
+                "eligible_session": [order.eligible_session for order in orders],
+                "ts_code": [order.asset.ts_code for order in orders],
+                "asset_type": [order.asset.asset_type.value for order in orders],
+                "amount": [order.amount for order in orders],
+                "filled": [order.filled for order in orders],
+                "average_price": [order.average_price for order in orders],
+                "status": [order.status.value for order in orders],
+                "reject_reason": [
+                    order.reject_reason.value if order.reject_reason else ""
+                    for order in orders
+                ],
+                "message": [order.message for order in orders],
+            },
+            columns=columns,
+        )
 
     @staticmethod
     def _transactions_frame(transactions: list[Transaction]) -> pd.DataFrame:
@@ -381,25 +523,36 @@ class TradingAlgorithm:
             "transfer_fee",
             "fees",
         ]
-        rows = [
+        return pd.DataFrame(
             {
-                "id": transaction.id,
-                "order_id": transaction.order_id,
-                "date": transaction.session,
-                "ts_code": transaction.asset.ts_code,
-                "asset_type": transaction.asset.asset_type.value,
-                "amount": transaction.amount,
-                "price": transaction.price,
-                "gross_value": transaction.gross_value,
-                "commission": transaction.fees.commission,
-                "stamp_tax": transaction.fees.stamp_tax,
-                "handling_fee": transaction.fees.handling_fee,
-                "transfer_fee": transaction.fees.transfer_fee,
-                "fees": transaction.fees.total,
-            }
-            for transaction in transactions
-        ]
-        return pd.DataFrame(rows, columns=columns)
+                "id": [transaction.id for transaction in transactions],
+                "order_id": [transaction.order_id for transaction in transactions],
+                "date": [transaction.session for transaction in transactions],
+                "ts_code": [transaction.asset.ts_code for transaction in transactions],
+                "asset_type": [
+                    transaction.asset.asset_type.value for transaction in transactions
+                ],
+                "amount": [transaction.amount for transaction in transactions],
+                "price": [transaction.price for transaction in transactions],
+                "gross_value": [
+                    transaction.gross_value for transaction in transactions
+                ],
+                "commission": [
+                    transaction.fees.commission for transaction in transactions
+                ],
+                "stamp_tax": [
+                    transaction.fees.stamp_tax for transaction in transactions
+                ],
+                "handling_fee": [
+                    transaction.fees.handling_fee for transaction in transactions
+                ],
+                "transfer_fee": [
+                    transaction.fees.transfer_fee for transaction in transactions
+                ],
+                "fees": [transaction.fees.total for transaction in transactions],
+            },
+            columns=columns,
+        )
 
     @staticmethod
     def _closed_trades_frame(trades: list[ClosedTrade]) -> pd.DataFrame:
@@ -415,22 +568,21 @@ class TradingAlgorithm:
             "fees",
             "holding_days",
         ]
-        rows = [
+        return pd.DataFrame(
             {
-                "ts_code": trade.asset.ts_code,
-                "asset_type": trade.asset.asset_type.value,
-                "entry_date": trade.entry_session,
-                "exit_date": trade.exit_session,
-                "quantity": trade.quantity,
-                "entry_price": trade.entry_price,
-                "exit_price": trade.exit_price,
-                "pnl": trade.pnl,
-                "fees": trade.fees,
-                "holding_days": trade.holding_days,
-            }
-            for trade in trades
-        ]
-        return pd.DataFrame(rows, columns=columns)
+                "ts_code": [trade.asset.ts_code for trade in trades],
+                "asset_type": [trade.asset.asset_type.value for trade in trades],
+                "entry_date": [trade.entry_session for trade in trades],
+                "exit_date": [trade.exit_session for trade in trades],
+                "quantity": [trade.quantity for trade in trades],
+                "entry_price": [trade.entry_price for trade in trades],
+                "exit_price": [trade.exit_price for trade in trades],
+                "pnl": [trade.pnl for trade in trades],
+                "fees": [trade.fees for trade in trades],
+                "holding_days": [trade.holding_days for trade in trades],
+            },
+            columns=columns,
+        )
 
     def run(self) -> BacktestResult:
         try:
@@ -477,7 +629,7 @@ class TradingAlgorithm:
         self._phase = "finished"
         performance = pd.DataFrame(self._performance_rows).set_index("date")
         performance.index = pd.DatetimeIndex(performance.index, name="date")
-        positions = pd.DataFrame(self._position_rows)
+        positions = pd.DataFrame(self._position_columns, columns=_POSITION_COLUMNS)
         orders = self._orders_frame(self.broker.orders)
         transactions = self._transactions_frame(self.broker.transactions)
         closed_trades = self._closed_trades_frame(self.broker.closed_trades)
@@ -538,6 +690,7 @@ def run_algorithm(
     show_progress: bool = True,
     plotly_js: PlotlyJsMode | str = PlotlyJsMode.INLINE,
     bundle_name: str = "tualpha",
+    column_cache_mib: int | None = None,
     fee_model: ChinaFeeModel | None = None,
 ) -> BacktestResult:
     """Run a point-in-time daily stock/ETF backtest.
@@ -559,6 +712,7 @@ def run_algorithm(
         show_progress=show_progress,
         plotly_js=plotly_js,
         bundle_name=bundle_name,
+        column_cache_mib=column_cache_mib,
     )
     return TradingAlgorithm(
         config,

@@ -60,9 +60,15 @@ def calculate_metrics(
     open_positions = 0
     if not daily_positions.empty:
         final_date = daily_positions["date"].max()
+        market_values = (
+            pd.to_numeric(daily_positions["market_value"], errors="coerce")
+            if "market_value" in daily_positions
+            else pd.Series(0.0, index=daily_positions.index)
+        )
         final_rows = daily_positions[
             (daily_positions["date"] == final_date)
             & (daily_positions["record_type"] == "POSITION")
+            & market_values.gt(0)
         ]
         open_positions = len(final_rows)
 

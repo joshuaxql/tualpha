@@ -68,6 +68,8 @@ class Order:
     amount: float
     created_session: pd.Timestamp
     eligible_session: pd.Timestamp
+    position_limit: int | None = None
+    cash_adaptive: bool = False
     id: int = field(default_factory=lambda: next(_ORDER_IDS))
     status: OrderStatus = OrderStatus.OPEN
     filled: float = 0.0
@@ -166,7 +168,15 @@ class Position:
         return self.total_cost / amount if amount > _EPSILON else 0.0
 
     def sellable_amount(self, session: pd.Timestamp) -> float:
-        return sum(lot.quantity for lot in self.lots if lot.settle_session <= session)
+        # Lots are appended in execution order, so settlement dates are monotonic.
+        # Usually only today's final lot is unsettled; walking backward avoids an
+        # O(lot_count) scan for every daily position capture.
+        unsettled = 0.0
+        for lot in reversed(self.lots):
+            if lot.settle_session <= session:
+                break
+            unsettled += lot.quantity
+        return self.amount - unsettled
 
     def add_lot(
         self,

@@ -14,6 +14,8 @@ from filelock import FileLock
 from tualpha import _csv_hdf5
 from tualpha._hdf5_store import (
     BUNDLE_PROTOCOL,
+    PACKED_ACCELERATION_FIELDS,
+    PACKED_LAYOUT,
     REQUIRED_BUNDLE_FILES,
     load_assets_manifest,
 )
@@ -60,6 +62,13 @@ def test_builds_fixed_hdf5_bundle(csv_dir: Path, bundle_root: Path) -> None:
     assert manifest["calendar_source"] == "tushare.trade_cal:SSE"
     assert manifest["session_count"] == 5
     assert manifest["asset_count"] == 4
+    assert manifest["packed_acceleration"] == {
+        "layout": PACKED_LAYOUT,
+        "row_count": 20,
+        "fields": {
+            role: list(fields) for role, fields in PACKED_ACCELERATION_FIELDS.items()
+        },
+    }
     assert {row["asset_type"] for row in manifest["assets"] if row["tradable"]} == {
         "stock",
         "etf",
@@ -88,6 +97,19 @@ def test_builds_fixed_hdf5_bundle(csv_dir: Path, bundle_root: Path) -> None:
             "turnover",
         )
         assert stock[0]["volume"] == pytest.approx(1_000_076.0)
+        assert set(daily["packed"]) == set(PACKED_ACCELERATION_FIELDS["daily"])
+        assert daily["packed"].attrs["layout"] == PACKED_LAYOUT
+        packed_close = daily["packed"]["close"][:]
+        expected_close = np.concatenate(
+            [
+                daily["data"][row["ts_code"]][:]["close"]
+                for row in sorted(
+                    (row for row in manifest["assets"] if row["tradable"]),
+                    key=lambda row: row["sid"],
+                )
+            ]
+        )
+        assert packed_close.tolist() == pytest.approx(expected_close.tolist())
 
     with h5py.File(result.path / "daily_basic.h5", "r") as daily_basic:
         values = daily_basic["data"]["000001.SZ"][:]

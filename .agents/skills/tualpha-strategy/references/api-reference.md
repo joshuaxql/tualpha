@@ -43,6 +43,10 @@ asset.is_etf
 order(asset, amount)
 order_value(asset, value)
 order_target(asset, target)
+order_target_many(
+    {asset_a: target_a, asset_b: target_b},
+    position_limit=400,  # 可选；D+1 先卖后买后限制正市值标的数
+)
 order_target_value(asset, target)
 order_percent(asset, percent)
 order_target_percent(asset, target)
@@ -56,6 +60,9 @@ get_open_orders(asset)
 - `target`：非负目标数量或目标市值；
 - `percent`：相对于当前组合价值的交易比例；
 - `order_target_percent`：非负目标权重，最常用；
+- `order_target_many`：按映射插入顺序批量提交目标数量，适合大型篮子并保持先卖后买的显式顺序；可选 `position_limit` 在 D+1 撮合时取消超过上限的新标的买单，不把退市零值审计残仓计入上限；
+- `order_target_many` 的买单在 D+1 按实际成交价和当时实际现金缩减至可负担交易单位；不足最小交易单位时取消且不记为现金不足拒单；
+- 单笔 `order_target_value` / `order_target_percent` 使用相同的 D+1 现金自适应规则；普通数量、金额和目标数量订单保留原现金不足拒单语义；
 - 金额和目标 API 使用当前原始收盘价估算数量，再按市场交易单位取整；
 - 下单仅允许在 `handle_data` 中；
 - 返回 `Order` 或在无需交易/无法形成有效数量时返回 `None`。
@@ -110,9 +117,12 @@ value = data.current(asset, "close")
 series = data.current(asset, ["close", "daily_basic.pe_ttm"])
 series = data.current(assets, "close")
 frame = data.current(assets, ["close", "daily_basic.pe_ttm"])
+arrays = data.current_arrays(assets, ["close", "daily_basic.total_mv"])
 ```
 
-返回形状：
+`current_arrays()` 面向大型固定资产池，返回字段名到只读 NumPy 数组的映射，数组顺序与传入资产顺序一致；策略不得修改返回数组。
+
+`current()` 返回形状：
 
 | 输入 | 返回 |
 |---|---|
@@ -306,4 +316,4 @@ output_dir/
 └── daily_positions.csv
 ```
 
-`report.html` 的组合归因表包含每个标的的成交次数、持有总天数、已实现盈亏、盈亏贡献占比、几何贡献收益和总费用。持有总天数按日终持仓数量大于零的唯一交易日统计；报告不再生成逐笔“交易分析”图表。
+`report.html` 的组合归因表包含每个标的的成交次数、持有总天数、已实现盈亏、盈亏贡献占比、每日权重贡献累计收益和总费用。贡献按 `Σ(日终权重×标的当日收益率)` 计算，现金贡献固定为 0。股票和 ETF 的持有总天数按日终正市值的唯一交易日统计；`CASH` 仅统计没有任何正市值股票或 ETF、组合全部为现金的交易日。报告不再生成逐笔“交易分析”图表。
