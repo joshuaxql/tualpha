@@ -183,6 +183,59 @@ def test_stock_and_etf_are_both_t1(data_root: Path) -> None:
     portal.close()
 
 
+def test_process_orders_uses_pending_index_not_historical_order_scan(
+    data_root: Path,
+) -> None:
+    class NonIterableHistory(list):
+        def __iter__(self):
+            raise AssertionError("historical orders must not be scanned during fills")
+
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+    broker = SimulationBroker(
+        Portfolio(100_000),
+        calendar,
+        portal,
+        ChinaFeeModel(),
+        ChinaMarketRules(),
+        "open",
+    )
+    session = pd.Timestamp("2024-01-02")
+    stock = finder.retrieve_asset("000001.SZ")
+    invalid = broker.submit(stock, 0, session, session)
+    assert invalid not in broker.get_open_orders()
+    order_object = broker.submit(stock, 100, session, session)
+    broker.orders = NonIterableHistory(broker.orders)
+    broker.process_orders(session)
+    assert order_object.status is OrderStatus.FILLED
+    assert broker.get_open_orders() == []
+    portal.close()
+
+
+def test_engine_marks_portfolio_once_per_session(data_root: Path) -> None:
+    algorithm = TradingAlgorithm(
+        BacktestConfig(
+            start="2024-01-02",
+            end="2024-01-04",
+            bundle_root=data_root,
+            generate_report=False,
+            show_progress=False,
+        )
+    )
+    calls = 0
+    original = algorithm.broker.mark_to_market
+
+    def counted(session: pd.Timestamp) -> None:
+        nonlocal calls
+        calls += 1
+        original(session)
+
+    algorithm.broker.mark_to_market = counted
+    result = algorithm.run()
+    assert calls == len(result.performance)
+
+
 def test_adjustment_factor_reinvests_held_position(data_root: Path) -> None:
     def initialize(context):
         context.asset = symbol("510300.SH")
@@ -242,9 +295,13 @@ def test_report_and_daily_positions_are_exported(
     assert result.positions_path == tmp_path / "daily_positions.csv"
     report = result.report_path.read_text(encoding="utf-8")
     assert "核心指标 (Key Metrics)" in report
+    assert "交易分析 (Trade Analysis)" not in report
+    assert "Trade PnL Distribution" not in report
     assert "费用与交易限制 (Fees & Trading Constraints)" in report
     assert "组合归因 (Attribution)" in report
     assert "<th>持有总天数</th>" in report
+    assert "<th>几何贡献收益</th>" in report
+    assert "1.05×0.97-1=1.85%" in report
     assert "<tr><td>000001.SZ</td><td>2</td><td>1</td>" in report
     assert "plotly" in report.lower()
     assert result.positions_path.read_bytes().startswith(b"\xef\xbb\xbf")

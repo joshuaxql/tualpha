@@ -1,17 +1,15 @@
-"""Stock and ETF assets loaded from the official Bundle asset database."""
+"""Tradable stock and ETF assets loaded from ``assets.pk``."""
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 import pandas as pd
-from zipline.assets import ASSET_DB_VERSION
 
+from ._hdf5_store import load_assets_manifest
 from .bundle import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,
@@ -53,7 +51,18 @@ class Asset:
     settlement_days: int = 1
 
     def is_alive_on(self, session: str | pd.Timestamp) -> bool:
-        date = normalize_session(session)
+        if (
+            isinstance(session, pd.Timestamp)
+            and session.tzinfo is None
+            and session.hour == 0
+            and session.minute == 0
+            and session.second == 0
+            and session.microsecond == 0
+            and session.nanosecond == 0
+        ):
+            date = session
+        else:
+            date = normalize_session(session)
         if self.list_date is not None and date < self.list_date:
             return False
         return self.delist_date is None or date <= self.delist_date
@@ -70,8 +79,21 @@ class Asset:
         return self.ts_code
 
 
+def _asset_date(value: object) -> pd.Timestamp | None:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    try:
+        return pd.to_datetime(str(numeric), format="%Y%m%d").normalize()
+    except ValueError as exc:
+        raise DataError(f"assets.pk contains an invalid asset date: {value}") from exc
+
+
 class AssetFinder:
-    """Resolve stable assets from Zipline's asset SQLite database."""
+    """Resolve stable tradable assets from the Bundle asset manifest."""
 
     def __init__(self, bundle_root: str | Path, bundle_name: str = BUNDLE_NAME) -> None:
         self.bundle_root = Path(bundle_root).expanduser()
@@ -79,75 +101,47 @@ class AssetFinder:
         lock_key, _ = acquire_bundle_read_lock(self.bundle_root, bundle_name)
         try:
             self.bundle_path = latest_bundle_path(self.bundle_root, bundle_name)
-            manifest = json.loads(
-                (self.bundle_path / "manifest.json").read_text(encoding="utf-8")
-            )
-            self.bundle_generation = str(manifest["generated_at"])
-            asset_db = self.bundle_path / f"assets-{ASSET_DB_VERSION}.sqlite"
-            if not asset_db.is_file():
-                raise DataError(f"bundle asset database does not exist: {asset_db}")
-            uri = f"file:{asset_db.resolve().as_posix()}?mode=ro"
-            connection = sqlite3.connect(uri, uri=True)
-            try:
-                rows = connection.execute(
-                    """
-                    WITH attributes AS (
-                        SELECT sid,
-                               max(CASE WHEN field = 'asset_type' THEN value END)
-                                   AS asset_type,
-                               max(CASE WHEN field = 'board' THEN value END) AS board,
-                               max(CASE WHEN field = 'price_tick' THEN value END)
-                                   AS price_tick
-                        FROM equity_supplementary_mappings
-                        GROUP BY sid
-                    )
-                    SELECT e.sid, m.symbol, e.asset_name, e.start_date, e.end_date,
-                           e.exchange, a.asset_type, a.board, a.price_tick
-                    FROM equities e
-                    JOIN equity_symbol_mappings m ON m.sid = e.sid
-                    LEFT JOIN attributes a ON a.sid = e.sid
-                    ORDER BY e.sid, m.end_date DESC
-                    """
-                ).fetchall()
-            finally:
-                connection.close()
+            manifest = load_assets_manifest(self.bundle_path / "assets.pk")
+            self.bundle_generation = str(manifest["generation"])
+            rows = [
+                row for row in manifest["assets"] if bool(row.get("tradable", False))
+            ]
         finally:
             release_bundle_read_lock(lock_key)
         if not rows:
-            raise DataError(f"bundle contains no stock or ETF assets: {asset_db}")
+            raise DataError(
+                f"bundle contains no stock or ETF assets: {self.bundle_path}"
+            )
 
-        assets = []
-        seen: set[int] = set()
+        assets: list[Asset] = []
         for row in rows:
-            sid = int(row[0])
-            if sid in seen:
-                continue
-            seen.add(sid)
             try:
-                asset_type = AssetType(str(row[6]))
-            except ValueError as exc:
-                raise DataError(f"unsupported bundled asset type: {row[6]}") from exc
+                asset_type = AssetType(str(row["asset_type"]))
+            except (KeyError, ValueError) as exc:
+                raise DataError(
+                    f"unsupported bundled asset type: {row.get('asset_type')}"
+                ) from exc
             try:
-                board = Board(str(row[7]))
+                board = Board(str(row.get("board", "unknown")))
             except ValueError:
                 board = Board.UNKNOWN
-            code = str(row[1]).upper()
+            code = str(row["ts_code"]).upper()
             assets.append(
                 Asset(
-                    sid=sid,
+                    sid=int(row["sid"]),
                     ts_code=code,
-                    symbol=code.split(".")[0],
-                    name=str(row[2] or ""),
+                    symbol=str(row.get("symbol") or code.split(".")[0]),
+                    name=str(row.get("name", "")),
                     asset_type=asset_type,
-                    exchange=str(row[5]),
+                    exchange=str(row.get("exchange", "")),
                     board=board,
-                    list_date=pd.Timestamp(int(row[3]), unit="ns").normalize(),
-                    delist_date=pd.Timestamp(int(row[4]), unit="ns").normalize(),
-                    price_tick=float(row[8]),
-                    settlement_days=1,
+                    list_date=_asset_date(row.get("list_date")),
+                    delist_date=_asset_date(row.get("delist_date")),
+                    price_tick=float(row.get("price_tick", 0.01)),
+                    settlement_days=int(row.get("settlement_days", 1)),
                 )
             )
-        self._assets = tuple(assets)
+        self._assets = tuple(sorted(assets, key=lambda asset: asset.sid))
         self._by_sid = {asset.sid: asset for asset in self._assets}
         self._by_code = {asset.ts_code: asset for asset in self._assets}
         self._by_symbol: dict[str, list[Asset]] = {}

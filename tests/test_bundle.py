@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import json
 import shutil
-import sqlite3
 import threading
 from pathlib import Path
 
-import bcolz
-import duckdb
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
 from filelock import FileLock
 
+from tualpha import _csv_hdf5
+from tualpha._hdf5_store import (
+    BUNDLE_PROTOCOL,
+    REQUIRED_BUNDLE_FILES,
+    load_assets_manifest,
+)
 from tualpha.bundle import (
     acquire_bundle_read_lock,
     build_bundle,
     bundle_lock_path,
-    bundle_parent,
+    cleanup_legacy_storage,
     latest_bundle_path,
     load_bundle_data,
     release_bundle_read_lock,
@@ -26,132 +30,118 @@ from tualpha.bundle import (
 from tualpha.exceptions import DataError
 
 
-def test_builds_fixed_official_bundle_with_bcolz_extensions(
-    csv_dir: Path, bundle_root: Path
+def test_csv_bucket_worker_materializes_sorted_buckets(
+    csv_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(_csv_hdf5, "_WORKER_FILE_THRESHOLD", 0)
+    buckets, observations = _csv_hdf5.bucket_daily(
+        csv_dir, tmp_path / "buckets", show_progress=False
+    )
+
+    assert ("000001.SZ", "stock") in observations
+    assert len(list(buckets.root.joinpath("sorted").glob("*.bin"))) == 16
+    assert not list(buckets.root.glob("_bucket=*"))
+
+
+def test_builds_fixed_hdf5_bundle(csv_dir: Path, bundle_root: Path) -> None:
     result = build_bundle(csv_dir, bundle_root=bundle_root, rebuild_normalized=True)
 
     assert result.asset_count == 4
     assert result.session_count == 5
-    assert result.path == bundle_root / "bundles" / "tualpha"
+    assert result.path == bundle_root / "bundle"
     assert latest_bundle_path(bundle_root) == result.path
-    assert (result.path / "assets-7.sqlite").is_file()
-    assert (result.path / "daily_equities.bcolz").is_dir()
-    assert (result.path / "minute_equities.bcolz" / "metadata.json").is_file()
-    assert (result.path / "adjustments.sqlite").is_file()
-    assert (result.path / "finance.sqlite").is_file()
-    assert (result.path / "index_constituents.sqlite").is_file()
-    assert not (result.path / "tualpha.duckdb").exists()
-    assert (result.path / "READY").is_file()
+    assert {path.name for path in result.path.iterdir()} == REQUIRED_BUNDLE_FILES
+    assert all(path.is_file() for path in result.path.iterdir())
+    assert not any("bcolz" in path.name.lower() for path in result.path.iterdir())
 
-    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 5
-    assert manifest["settlement_days"] == 1
-    assert manifest["volume_multiplier"] == 100.0
-    assert manifest["finance"] == "finance.sqlite"
-    assert manifest["index_constituents"] == "index_constituents.sqlite"
-    assert manifest["index_constituent_rows"] == 19
-    assert manifest["index_constituent_snapshots"] == 10
-    assert manifest["index_constituent_codes"] == [
-        "000300.SH",
-        "000852.SH",
-        "000905.SH",
-        "000906.SH",
-        "899050.BJ",
+    manifest = load_assets_manifest(result.path / "assets.pk")
+    assert manifest["protocol"] == BUNDLE_PROTOCOL
+    assert manifest["schema_version"] == 7
+    assert manifest["calendar_source"] == "tushare.trade_cal:SSE"
+    assert manifest["session_count"] == 5
+    assert manifest["asset_count"] == 4
+    assert {row["asset_type"] for row in manifest["assets"] if row["tradable"]} == {
+        "stock",
+        "etf",
+    }
+    assert np.load(result.path / "trade_dates.npy", allow_pickle=False).tolist() == [
+        20240102,
+        20240103,
+        20240104,
+        20240105,
+        20240108,
     ]
-    assert "000985.CSI" in manifest["benchmark_sids"]
 
-    daily = bcolz.open(rootdir=str(result.path / "daily_equities.bcolz"), mode="r")
-    assert "ta_daily_basic__pe" in daily.names
-    assert "ta_moneyflow__net_mf_amount" in daily.names
-    assert "ta_industry__l1_name" in daily.names
-    assert "ta_stock_st__is_st" in daily.names
-    assert all(len(daily[name]) == len(daily) for name in daily.names)
-    assert len(np.unique(daily["id"][:])) == 4
-    assert np.isfinite(daily["ta_daily_basic__pe"][:]).sum() == 5
-    assert daily["ta_stock_st__is_st"][:].sum() == 1
-    field_registry = daily.attrs["tualpha_fields"]
-    assert "daily_basic.pe_ttm" in field_registry
-    industry_spec = field_registry["industry.l1_name"]
-    assert industry_spec["kind"] == "categorical"
-    assert "银行" in industry_spec["categories"]
-    assert daily[industry_spec["column"]].dtype == np.dtype("int32")
-    index_daily = bcolz.open(rootdir=str(result.path / "index_daily.bcolz"), mode="r")
-    assert len(index_daily) == 5
-    assert len(np.unique(index_daily["id"][:])) == 1
+    with h5py.File(result.path / "daily.h5", "r") as daily:
+        assert daily.attrs["protocol"] == BUNDLE_PROTOCOL
+        assert daily.attrs["generation"] == manifest["generation"]
+        assert set(daily["data"]) >= {"000001.SZ", "510300.SH", "000985.CSI"}
+        stock = daily["data"]["000001.SZ"][:]
+        assert stock.dtype.names == (
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "volume",
+            "turnover",
+        )
+        assert stock[0]["volume"] == pytest.approx(1_000_076.0)
 
-    asset_db = sqlite3.connect(result.path / "assets-7.sqlite")
-    try:
-        assert (
-            asset_db.execute(
-                "SELECT count(*) FROM equity_supplementary_mappings "
-                "WHERE field = 'asset_type' AND value = 'etf'"
-            ).fetchone()[0]
-            == 2
-        )
-    finally:
-        asset_db.close()
+    with h5py.File(result.path / "daily_basic.h5", "r") as daily_basic:
+        values = daily_basic["data"]["000001.SZ"][:]
+        assert np.isfinite(values["pe"]).sum() == 5
+        fields = json.loads(daily_basic.attrs["fields"])
+        assert "pe_ttm" in fields
 
-    finance = sqlite3.connect(result.path / "finance.sqlite")
-    try:
-        assert finance.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert (
-            finance.execute("SELECT count(*) FROM financial_income").fetchone()[0] == 3
-        )
-    finally:
-        finance.close()
-
-    constituents = sqlite3.connect(result.path / "index_constituents.sqlite")
-    try:
-        assert constituents.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-        assert (
-            constituents.execute("SELECT count(*) FROM index_constituents").fetchone()[
-                0
-            ]
-            == 19
-        )
-        assert (
-            constituents.execute(
-                "SELECT value FROM index_constituent_metadata "
-                "WHERE key = 'generated_at'"
-            ).fetchone()[0]
-            == manifest["generated_at"]
-        )
-    finally:
-        constituents.close()
+    with h5py.File(result.path / "stock_st.h5", "r") as stock_st:
+        assert stock_st["data"]["000001.SZ"][:]["is_st"].sum() == 1
+    with h5py.File(result.path / "finance.h5", "r") as finance:
+        assert len(finance["data"]["income"]["000001.SZ"]) == 3
+    with h5py.File(result.path / "index_weight.h5", "r") as weights:
+        assert sum(len(dataset) for dataset in weights["data"].values()) == 19
 
     loaded = load_bundle_data(bundle_root)
     try:
-        asset = loaded.asset_finder.retrieve_asset(1)
-        assert asset is not None
-        assert loaded.equity_daily_bar_reader.get_value(
-            1, pd.Timestamp("2024-01-02"), "volume"
-        ) == pytest.approx(1_000_076.0)
+        assert loaded.asset_finder.retrieve_asset(1).ts_code == "000001.SZ"
+        assert loaded.h5["daily"]["data"]["000001.SZ"][0]["close"] == 10.0
     finally:
         loaded.close()
 
-    published = [
-        path
-        for path in bundle_parent(bundle_root).iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    ]
-    assert published == [result.path]
-    assert all(not path.name[:4].isdigit() for path in published)
     status = json.loads(update_status_path(bundle_root).read_text(encoding="utf-8"))
     assert status["operation"] == "bundle_build"
+    assert status["active_generation"] == manifest["generation"]
     assert status["last_bundle_build"]["bundle_path"] == str(result.path)
 
 
-def test_latest_bundle_falls_back_to_interrupted_previous(
-    data_root: Path,
-) -> None:
+def test_latest_bundle_recovers_interrupted_rollback(data_root: Path) -> None:
     current = latest_bundle_path(data_root)
-    previous = current.parent / ".previous-tualpha-interrupted"
+    previous = data_root / ".rollback" / "interrupted" / "bundle"
+    previous.parent.mkdir(parents=True)
     current.replace(previous)
-    try:
-        assert latest_bundle_path(data_root) == previous
-    finally:
-        previous.replace(current)
+    assert latest_bundle_path(data_root) == current
+    assert current.is_dir()
+    assert not previous.exists()
+
+
+def test_legacy_storage_cleanup_is_scoped_to_bundle_root(tmp_path: Path) -> None:
+    root = tmp_path / ".tualpha"
+    active = root / "bundle"
+    active.mkdir(parents=True)
+    (active / "keep.txt").write_text("keep", encoding="utf-8")
+    legacy_bcolz = root / "bundles" / "tualpha" / "daily_equities.bcolz"
+    legacy_bcolz.mkdir(parents=True)
+    legacy_cache = root / "cache" / "tualpha" / "normalized.duckdb"
+    legacy_cache.parent.mkdir(parents=True)
+    legacy_cache.write_bytes(b"legacy")
+
+    removed = cleanup_legacy_storage(root)
+
+    assert len(removed) == 2
+    assert active.joinpath("keep.txt").is_file()
+    assert not root.joinpath("bundles").exists()
+    assert not root.joinpath("cache").exists()
 
 
 def test_bundle_read_lock_releases_across_threads(tmp_path: Path) -> None:
@@ -219,7 +209,7 @@ def test_bundle_name_and_source_paths_cannot_escape_managed_root(
         build_bundle(overlapping_csv, bundle_root=root)
 
 
-def test_normalized_cache_is_not_reused_for_another_csv_source(
+def test_rebuild_reads_csv_directly_without_database_cache(
     csv_dir: Path, tmp_path: Path
 ) -> None:
     alternate = tmp_path / "alternate-csv"
@@ -235,9 +225,9 @@ def test_normalized_cache_is_not_reused_for_another_csv_source(
 
     loaded = load_bundle_data(root)
     try:
-        assert loaded.equity_daily_bar_reader.get_value(
-            1, pd.Timestamp("2024-01-02"), "close"
-        ) == pytest.approx(99.0)
+        assert loaded.h5["daily"]["data"]["000001.SZ"][0]["close"] == pytest.approx(
+            99.0
+        )
     finally:
         loaded.close()
 
@@ -247,20 +237,9 @@ def test_normalized_cache_is_not_reused_for_another_csv_source(
     build_bundle(alternate, bundle_root=root)
     loaded = load_bundle_data(root)
     try:
-        assert loaded.equity_daily_bar_reader.get_value(
-            1, pd.Timestamp("2024-01-02"), "close"
-        ) == pytest.approx(7.0)
+        assert loaded.h5["daily"]["data"]["000001.SZ"][0]["close"] == pytest.approx(7.0)
     finally:
         loaded.close()
 
-    connection = duckdb.connect(
-        str(root / "cache" / "tualpha" / "normalized.duckdb"),
-        read_only=True,
-    )
-    try:
-        cached_source = connection.execute(
-            "SELECT value FROM store_metadata WHERE key = 'csv_dir'"
-        ).fetchone()[0]
-    finally:
-        connection.close()
-    assert Path(cached_source) == alternate.resolve()
+    assert not (root / "cache").exists()
+    assert not list(root.rglob("*.duckdb"))

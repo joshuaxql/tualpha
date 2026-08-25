@@ -19,11 +19,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from filelock import FileLock
 
+from ._calendar_store import normalize_trade_calendar
+from ._hdf5_store import load_assets_manifest
 from .bundle import (
     BUNDLE_NAME,
-    NormalizedStore,
     build_bundle,
-    normalized_store_path,
     paths_overlap,
     update_status_path,
     validate_bundle_name,
@@ -32,7 +32,7 @@ from .config import DEFAULT_BUNDLE_ROOT
 from .exceptions import ConfigurationError, DataError
 from .tushare_fields import FINANCIAL_FIELDS
 
-UPDATE_SCHEMA_VERSION = 2
+UPDATE_SCHEMA_VERSION = 3
 INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION = 1
 DEFAULT_INDEX_WEIGHT_CODES = (
     "000300.SH",
@@ -288,8 +288,15 @@ class DataUpdater:
             raise DataError("index_basic returned no indices")
 
         today = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
-        calendar_start = today - pd.DateOffset(years=1)
-        calendar_end = today + pd.DateOffset(years=2)
+        requested_starts = [today - pd.DateOffset(years=1)]
+        for value in (self.options.start, self.options.repair_from):
+            if value:
+                requested_starts.append(pd.Timestamp(value))
+        calendar_start = min(requested_starts)
+        calendar_end = max(
+            today + pd.DateOffset(years=2),
+            pd.Timestamp(self.options.end) if self.options.end else today,
+        )
         calendar_update = self._fetch_paginated(
             "trade_cal",
             {
@@ -307,9 +314,7 @@ class DataUpdater:
             calendar_update = pd.concat(
                 [existing_calendar, calendar_update], ignore_index=True, sort=False
             )
-        trade_cal = self._normalize_frame(calendar_update, ["exchange", "cal_date"])
-        if trade_cal.empty:
-            raise DataError("trade_cal returned no calendar rows")
+        trade_cal = normalize_trade_calendar(calendar_update)
 
         for filename, frame in (
             ("stock_basic.csv", stock),
@@ -918,7 +923,6 @@ class DataUpdater:
         staging = Path(str(staging_value))
         manifest_path = staging / "backups" / "manifest.json"
         committed = (staging / "BUNDLE_PUBLISHED").is_file()
-        restored = False
         if manifest_path.is_file() and not committed:
             entries = json.loads(manifest_path.read_text(encoding="utf-8"))
             for entry in reversed(entries):
@@ -941,13 +945,6 @@ class DataUpdater:
                     backup.unlink(missing_ok=True)
                 else:
                     destination.unlink(missing_ok=True)
-                restored = True
-            if restored:
-                cache = normalized_store_path(
-                    self.options.bundle_root, self.options.bundle_name
-                )
-                cache.unlink(missing_ok=True)
-                Path(f"{cache}.wal").unlink(missing_ok=True)
         staging.mkdir(parents=True, exist_ok=True)
         (staging / "RECOVERED.txt").write_text(
             "bundle already published\n" if committed else "CSV files restored\n",
@@ -1020,6 +1017,7 @@ class DataUpdater:
             self._write_status(
                 {
                     "status": "running",
+                    "phase": "download",
                     **run_metadata,
                     "staging_path": str(staging),
                 }
@@ -1027,7 +1025,6 @@ class DataUpdater:
             publications: list[tuple[Path, Path]] = []
             journal: list[dict[str, Any]] = []
             backups: list[tuple[Path, Path, bool]] = []
-            store: NormalizedStore | None = None
             bundle_published = False
             dates: list[str] = []
             try:
@@ -1065,6 +1062,7 @@ class DataUpdater:
                     self._write_status(
                         {
                             "status": "dry_run_succeeded",
+                            "phase": "download",
                             **run_metadata,
                             "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
                             "result": asdict(result),
@@ -1074,12 +1072,6 @@ class DataUpdater:
                     return result
 
                 backups = self._publish_files(publications, staging / "backups")
-                store = NormalizedStore(
-                    self.options.csv_dir,
-                    self.options.bundle_root,
-                    self.options.bundle_name,
-                )
-                store.sync_dates(dates)
                 bundle = build_bundle(
                     self.options.csv_dir,
                     bundle_root=self.options.bundle_root,
@@ -1099,10 +1091,20 @@ class DataUpdater:
                     bundle_path=str(bundle.path),
                     dry_run=False,
                 )
+                active_manifest = load_assets_manifest(bundle.path / "assets.pk")
                 completed_at = datetime.now(ZoneInfo("UTC")).isoformat()
                 self._write_status(
                     {
                         "status": "succeeded",
+                        "phase": "reopen",
+                        "active_generation": active_manifest["generation"],
+                        "storage": "hdf5",
+                        "bundle_schema": active_manifest["schema_version"],
+                        "verification": {
+                            "structural": "passed",
+                            "sha256": "passed",
+                            "reader": "passed",
+                        },
                         **run_metadata,
                         "completed_at": completed_at,
                         "result": asdict(result),
@@ -1120,20 +1122,13 @@ class DataUpdater:
             except Exception as exc:
                 if backups and not bundle_published:
                     self._restore_files(backups)
-                    if store is not None and dates:
-                        try:
-                            store.sync_dates(dates)
-                        except Exception as rollback_error:  # noqa: BLE001
-                            (staging / "ROLLBACK_FAILED.txt").write_text(
-                                f"{type(rollback_error).__name__}: {rollback_error}",
-                                encoding="utf-8",
-                            )
                 (staging / "FAILED.txt").write_text(
                     f"{type(exc).__name__}: {exc}", encoding="utf-8"
                 )
                 self._write_status(
                     {
                         "status": "failed",
+                        "phase": "build" if publications else "download",
                         **run_metadata,
                         "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
                         "updated_dates": dates,

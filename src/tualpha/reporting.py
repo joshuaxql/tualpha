@@ -294,45 +294,6 @@ def _benchmark_chart(result: BacktestResult) -> go.Figure:
     return _base_layout(figure)
 
 
-def _trade_distribution(trades: pd.DataFrame) -> go.Figure:
-    if trades.empty:
-        return _empty_figure(
-            "交易盈亏分布 (Trade PnL Distribution)", "回测期间没有已平仓交易"
-        )
-    figure = go.Figure(
-        go.Histogram(x=trades["pnl"], nbinsx=40, marker_color=_COLORS["accent"])
-    )
-    figure.update_layout(title="交易盈亏分布 (Trade PnL Distribution)")
-    figure.update_xaxes(title="盈亏")
-    figure.update_yaxes(title="频次")
-    return _base_layout(figure)
-
-
-def _trade_duration(trades: pd.DataFrame) -> go.Figure:
-    if trades.empty:
-        return _empty_figure(
-            "盈亏 vs 持仓时间 (PnL vs Duration)", "回测期间没有已平仓交易"
-        )
-    colors = [
-        _COLORS["success"] if value >= 0 else _COLORS["danger"]
-        for value in trades["pnl"]
-    ]
-    figure = go.Figure(
-        go.Scatter(
-            x=trades["holding_days"],
-            y=trades["pnl"],
-            mode="markers",
-            text=trades["ts_code"],
-            marker={"color": colors, "size": 8, "opacity": 0.75},
-            hovertemplate="%{text}<br>持仓 %{x} 天<br>盈亏 %{y:,.2f}<extra></extra>",
-        )
-    )
-    figure.update_layout(title="盈亏 vs 持仓时间 (PnL vs Duration)")
-    figure.update_xaxes(title="持仓时间（天）")
-    figure.update_yaxes(title="盈亏")
-    return _base_layout(figure)
-
-
 def _metric_card(label: str, value: str, css_class: str = "") -> str:
     return (
         '<div class="metric-card">'
@@ -340,6 +301,38 @@ def _metric_card(label: str, value: str, css_class: str = "") -> str:
         f'<div class="metric-label">{escape(label)}</div>'
         "</div>"
     )
+
+
+def _geometric_link(returns: pd.Series) -> float:
+    values = pd.to_numeric(returns, errors="coerce").dropna().to_numpy(dtype=float)
+    return float(np.prod(1.0 + values) - 1.0) if len(values) else 0.0
+
+
+def _geometric_attribution(result: BacktestResult) -> pd.Series:
+    if result.performance.empty or "returns" not in result.performance:
+        return pd.Series(dtype=float)
+    returns = pd.to_numeric(result.performance["returns"], errors="coerce").fillna(0.0)
+    assigned = pd.Series("CASH", index=returns.index, dtype=object)
+    positions = result.daily_positions
+    required = {"record_type", "ts_code", "date", "quantity", "market_value"}
+    if not positions.empty and required.issubset(positions.columns):
+        held = positions[
+            positions["record_type"].eq("POSITION")
+            & pd.to_numeric(positions["quantity"], errors="coerce").gt(0)
+            & pd.to_numeric(positions["market_value"], errors="coerce").gt(0)
+        ].copy()
+        if not held.empty:
+            held["date"] = pd.to_datetime(held["date"]).dt.normalize()
+            daily_values = (
+                held.groupby(["date", "ts_code"])["market_value"]
+                .sum()
+                .unstack(fill_value=0.0)
+            )
+            dominant = daily_values.idxmax(axis=1)
+            common = assigned.index.intersection(dominant.index)
+            assigned.loc[common] = dominant.loc[common]
+    frame = pd.DataFrame({"group": assigned, "return": returns}, index=returns.index)
+    return frame.groupby("group", sort=False)["return"].apply(_geometric_link)
 
 
 def _attribution_rows(result: BacktestResult) -> str:
@@ -355,7 +348,7 @@ def _attribution_rows(result: BacktestResult) -> str:
         ]
         holding_days = held.groupby("ts_code")["date"].nunique()
     if trades.empty and transactions.empty and holding_days.empty:
-        return '<tr><td colspan="6" class="muted">无交易归因数据</td></tr>'
+        return '<tr><td colspan="7" class="muted">无交易归因数据</td></tr>'
     pnl = (
         trades.groupby("ts_code")["pnl"].sum()
         if not trades.empty
@@ -371,10 +364,20 @@ def _attribution_rows(result: BacktestResult) -> str:
         if not transactions.empty
         else pd.Series(dtype=float)
     )
-    codes = pnl.index.union(counts.index).union(fees.index).union(holding_days.index)
+    geometric = _geometric_attribution(result)
+    codes = (
+        pnl.index.union(counts.index)
+        .union(fees.index)
+        .union(holding_days.index)
+        .union(geometric.index)
+    )
     total_pnl = float(pnl.sum())
+    ordered_codes = sorted(
+        codes,
+        key=lambda item: (item == "CASH", -float(pnl.get(item, 0.0))),
+    )
     rows = []
-    for code in sorted(codes, key=lambda item: float(pnl.get(item, 0.0)), reverse=True):
+    for code in ordered_codes:
         value = float(pnl.get(code, 0.0))
         contribution = value / total_pnl if total_pnl else np.nan
         rows.append(
@@ -384,6 +387,7 @@ def _attribution_rows(result: BacktestResult) -> str:
             f"<td>{int(holding_days.get(code, 0))}</td>"
             f"<td>{_money(value)}</td>"
             f"<td>{_percent(contribution)}</td>"
+            f"<td>{_percent(geometric.get(code, 0.0))}</td>"
             f"<td>{_money(fees.get(code, 0.0))}</td>"
             "</tr>"
         )
@@ -430,8 +434,6 @@ def generate_html_report(result: BacktestResult, path: str | Path) -> Path:
             _daily_distribution(performance),
             _rolling_risk(performance, result.config.annualization_factor),
             _benchmark_chart(result),
-            _trade_distribution(result.closed_trades),
-            _trade_duration(result.closed_trades),
         ],
         result.config.plotly_js,
     )
@@ -517,12 +519,12 @@ footer{{text-align:center;margin-top:45px;padding-top:18px;border-top:1px solid 
 <div class="section-title">权益与回撤 (Equity & Drawdown)</div><div class="chart">{figures[0]}</div>
 <div class="section-title">收益分析 (Return Analysis)</div><div class="row"><div class="chart">{figures[1]}</div><div class="chart">{figures[2]}</div></div><div class="chart">{figures[3]}</div>
 <div class="section-title">基准对比 (Benchmark Comparison)</div>{benchmark_metrics}<div class="chart">{figures[4]}</div>
-<div class="section-title">交易分析 (Trade Analysis)</div><div class="row"><div class="chart">{figures[5]}</div><div class="chart">{figures[6]}</div></div>
 <div class="section-title">费用与交易限制 (Fees & Trading Constraints)</div><div class="row">
 <div class="table-wrap"><table><thead><tr><th>费用项目</th><th>金额</th></tr></thead><tbody>{fee_rows}</tbody></table></div>
 <div class="table-wrap"><table><thead><tr><th>拒单原因</th><th>次数</th></tr></thead><tbody>{_rejection_rows(result)}</tbody></table></div>
 </div>
-<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>贡献占比</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
+<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>盈亏贡献占比</th><th>几何贡献收益</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
+<p class="muted">几何贡献收益按日终市值最大的实际持仓归属每日组合收益，并按 ∏(1+r)-1 链接；例如 +5% 后 -3% 为 1.05×0.97-1=1.85%。</p>
 <footer>TuAlpha Report · Powered by Plotly · 股票与 ETF 日频回测</footer>
 </div></body></html>"""
     destination = Path(path)

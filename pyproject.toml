@@ -1,6 +1,6 @@
 [project]
 name = "tualpha"
-version = "0.6.0"
+version = "0.8.0"
 description = "Event-driven daily backtesting for China A-share stocks and ETFs"
 readme = "README.md"
 keywords = ["backtest", "quant", "a-share", "etf", "tushare"]
@@ -17,15 +17,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "bcolz-zipline==1.13.0",
-    "duckdb>=1.4",
     "filelock>=3.16",
+    "h5py>=3.12",
     "numpy>=2.0",
     "pandas>=2.2",
     "plotly>=5.24",
+    "polars>=1.20",
     "tqdm>=4.67",
     "tushare>=1.4",
-    "zipline-reloaded==3.1.1",
 ]
 
 [project.scripts]

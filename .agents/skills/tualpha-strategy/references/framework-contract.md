@@ -123,6 +123,6 @@ snapshot_date < 当前回测日
 - 计算未来收益后用于当前排名；
 - 使用负向 `shift`；
 - 用回测结束日复权因子统一重写过去回调可见价格；
-- 绕过 DataPortal 读取 CSV、数据库或 Bcolz；
+- 绕过 DataPortal 读取 CSV、HDF5、NumPy 或 Pickle Bundle 文件；
 - 仅按财务报告期过滤而忽略公告日期；
 - 使用当前行业分类或 ST 列表回填历史。

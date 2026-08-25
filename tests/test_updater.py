@@ -6,16 +6,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-import duckdb
 import pandas as pd
 import pytest
 
-from tualpha.bundle import (
-    NormalizedStore,
-    bundle_path,
-    normalized_store_path,
-    update_status_path,
-)
+from tualpha.bundle import bundle_path, update_status_path
 from tualpha.cli import run_cli
 from tualpha.exceptions import ConfigurationError, DataError
 from tualpha.updater import (
@@ -269,11 +263,11 @@ def test_dry_run_status_keeps_request_and_build_history(
     assert status["last_bundle_build"]["bundle_path"] == "previous-build"
 
 
-def test_failed_bundle_build_restores_published_csv_and_cache(
+def test_failed_bundle_build_restores_published_csv(
     csv_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundle_root = tmp_path / "bundle"
-    NormalizedStore(csv_dir, bundle_root).rebuild()
+    bundle_root.mkdir()
     update_status_path(bundle_root).write_text(
         json.dumps(
             {
@@ -320,15 +314,7 @@ def test_failed_bundle_build_restores_published_csv_and_cache(
     assert status["last_bundle_build"]["bundle_path"] == "previous-build"
     assert status["requested_start"] == "20240108"
     assert status["requested_end"] == "20240108"
-    connection = duckdb.connect(str(normalized_store_path(bundle_root)), read_only=True)
-    try:
-        close = connection.execute(
-            "SELECT close FROM prices WHERE ts_code = '000001.SZ' "
-            "AND trade_date = DATE '2024-01-08'"
-        ).fetchone()[0]
-    finally:
-        connection.close()
-    assert close == 11.0
+    assert not list(bundle_root.rglob("*.duckdb"))
 
 
 def test_interrupted_csv_publication_is_recovered(
@@ -344,9 +330,6 @@ def test_interrupted_csv_publication_is_recovered(
     staged.parent.mkdir(parents=True)
     staged.write_text("new\n", encoding="utf-8")
     DataUpdater._publish_files([(staged, destination)], staging / "backups")
-    cache = normalized_store_path(bundle_root)
-    cache.parent.mkdir(parents=True)
-    cache.write_bytes(b"stale cache")
     update_status_path(bundle_root).write_text(
         json.dumps(
             {
@@ -368,7 +351,7 @@ def test_interrupted_csv_publication_is_recovered(
     updater._recover_interrupted_run()
 
     assert destination.read_text(encoding="utf-8") == "old\n"
-    assert not cache.exists()
+    assert not list(bundle_root.rglob("*.duckdb"))
     assert (staging / "RECOVERED.txt").is_file()
     status = json.loads(update_status_path(bundle_root).read_text(encoding="utf-8"))
     assert status["status"] == "failed"

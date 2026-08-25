@@ -165,13 +165,30 @@ def csv_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         ),
         root / "index_basic.csv",
     )
+    calendar_dates = [
+        "20240102",
+        "20240103",
+        "20240104",
+        "20240105",
+        "20240106",
+        "20240107",
+        "20240108",
+    ]
     _write(
         pd.DataFrame(
             {
                 "exchange": "SSE",
-                "cal_date": SESSIONS,
-                "is_open": "1",
-                "pretrade_date": ["20231229", *SESSIONS[:-1]],
+                "cal_date": calendar_dates,
+                "is_open": ["1", "1", "1", "1", "0", "0", "1"],
+                "pretrade_date": [
+                    "20231229",
+                    "20240102",
+                    "20240103",
+                    "20240104",
+                    "20240105",
+                    "20240105",
+                    "20240105",
+                ],
             }
         ),
         root / "trade_cal.csv",

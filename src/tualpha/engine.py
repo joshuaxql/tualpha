@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
+# Avoid a background monitor thread while native HDF5 readers are active on Windows.
+tqdm.monitor_interval = 0
+
 from .api import bind_algorithm
 from .assets import Asset, AssetFinder
 from .broker import SimulationBroker
@@ -286,21 +289,23 @@ class TradingAlgorithm:
                 "portfolio_value": portfolio_value,
             }
         )
-        for asset, position in self.broker.iter_positions():
-            raw_close = self.data_portal.value(asset, session, "close", adjusted=False)
+        position_items = list(self.broker.iter_positions())
+        position_assets = [asset for asset, _ in position_items]
+        adjusted_closes = self.data_portal.values(
+            position_assets,
+            session,
+            ["close"],
+            adjusted=True,
+            reference_session=self.config.end,
+        )["close"]
+        for (asset, position), adjusted_close in zip(
+            position_items, adjusted_closes, strict=True
+        ):
+            raw_close = position.last_sale_price
             if asset.delist_date is not None and session > asset.delist_date:
                 raw_close = 0.0
-            elif not np.isfinite(raw_close):
-                raw_close = position.last_sale_price
             # CSV export is produced after the run, so it uses a conventional
             # end-normalized qfq series without exposing that denominator to callbacks.
-            adjusted_close = self.data_portal.value(
-                asset,
-                session,
-                "close",
-                adjusted=True,
-                reference_session=self.config.end,
-            )
             market_value = position.amount * raw_close
             self._position_rows.append(
                 {
@@ -462,7 +467,8 @@ class TradingAlgorithm:
                 with bind_algorithm(self):
                     self._phase = "handle_data"
                     self.handle_data_callback(self.context, self.data)
-                self.broker.mark_to_market(session)
+                # Callback orders cannot fill until a later session, so the
+                # pre-callback valuation remains current for end-of-day capture.
                 self._capture_session(session, previous_value, transaction_start)
                 previous_value = self.portfolio.portfolio_value
                 previous_session = session

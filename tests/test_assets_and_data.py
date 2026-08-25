@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import json
 import shutil
+from importlib.util import find_spec
 from pathlib import Path
 
-import duckdb
+import h5py
 import pandas as pd
 import pytest
 
+from tualpha._hdf5_store import REQUIRED_BUNDLE_FILES
 from tualpha.assets import AssetFinder, Board
 from tualpha.bundle import latest_bundle_path
 from tualpha.calendar import ChinaTradingCalendar
@@ -53,6 +54,89 @@ def test_extended_daily_fields_are_available_without_csv_reads(data_root: Path) 
     assert "daily_basic.pe_ttm" in portal.available_fields("daily_basic")
     with pytest.raises(KeyError, match="unknown daily field"):
         portal.value(stock, "2024-01-02", "daily_basic.missing")
+    portal.close()
+
+
+@pytest.mark.parametrize("adjustment", ["raw", "qfq", "hfq"])
+def test_vectorized_current_matches_scalar_values_and_uses_bounded_cache(
+    data_root: Path,
+    adjustment: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = [
+        finder.retrieve_asset(code)
+        for code in ("000001.SZ", "688001.SH", "510300.SH", "513100.SH")
+    ]
+    fields = [
+        "open",
+        "close",
+        "pre_close",
+        "volume",
+        "up_limit",
+        "down_limit",
+        "suspended",
+        "daily_basic.pe",
+        "industry.l1_name",
+        "stock_st.is_st",
+    ]
+    portal = TushareDataPortal(data_root, finder, calendar, adjustment, "2024-01-08")
+    data = BarData(portal)
+    data._set_session("2024-01-04")
+    frame = data.current(assets, fields)
+
+    for asset in assets:
+        for field in fields:
+            actual = frame.loc[asset.ts_code, field]
+            expected = portal.value(asset, "2024-01-04", field)
+            if expected is None:
+                assert actual is None
+            elif isinstance(expected, str):
+                assert actual == expected
+            elif pd.isna(expected):
+                assert pd.isna(actual)
+            else:
+                assert float(actual) == pytest.approx(float(expected))
+
+    original = frame.loc["000001.SZ", "daily_basic.pe"]
+    frame.loc["000001.SZ", "daily_basic.pe"] = -999.0
+
+    def fail_scalar(*args: object, **kwargs: object) -> object:
+        raise AssertionError("multi-asset current must not call scalar portal.value")
+
+    monkeypatch.setattr(portal, "value", fail_scalar)
+    fresh = data.current(assets, fields)
+    assert fresh.loc["000001.SZ", "daily_basic.pe"] == original
+    assert portal._column_cache
+    assert portal._column_cache_bytes <= 1024 * 1024**2
+    assert all(not values.flags.writeable for values in portal._column_cache.values())
+    portal.clear_cache()
+    assert not portal._column_cache
+    assert portal._column_cache_bytes == 0
+    portal.close()
+
+
+def test_batch_execution_bars_match_scalar_market_fields(data_root: Path) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = [
+        finder.retrieve_asset(code) for code in ("000001.SZ", "688001.SH", "510300.SH")
+    ]
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+    bars = portal.execution_bars(assets, "2024-01-03", "open")
+    for asset in assets:
+        scalar = portal.raw_bar(asset, "2024-01-03")
+        batch = bars[asset]
+        assert (batch is None) is (scalar is None)
+        if scalar is None:
+            continue
+        assert batch is not None
+        assert batch.open == pytest.approx(scalar.open, nan_ok=True)
+        assert batch.volume == pytest.approx(scalar.volume)
+        assert batch.up_limit == pytest.approx(scalar.up_limit, nan_ok=True)
+        assert batch.down_limit == pytest.approx(scalar.down_limit, nan_ok=True)
+        assert batch.suspended is scalar.suspended
     portal.close()
 
 
@@ -146,31 +230,20 @@ def test_index_constituents_are_strictly_point_in_time(data_root: Path) -> None:
     portal.close()
 
 
-def test_schema_v4_bundle_still_supports_non_constituent_reads(
-    data_root: Path, tmp_path: Path
-) -> None:
-    legacy_root = tmp_path / "legacy"
-    legacy_path = legacy_root / "bundles" / "tualpha"
-    shutil.copytree(latest_bundle_path(data_root), legacy_path)
-    (legacy_path / "index_constituents.sqlite").unlink()
-    manifest_path = legacy_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["schema_version"] = 4
-    for key in list(manifest):
-        if key.startswith("index_constituent"):
-            del manifest[key]
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+def test_bundle_has_only_schema7_protocol_files(data_root: Path) -> None:
+    path = latest_bundle_path(data_root)
+    assert {entry.name for entry in path.iterdir()} == REQUIRED_BUNDLE_FILES
+    assert not any("bcolz" in entry.name.lower() for entry in path.iterdir())
 
-    finder = AssetFinder(legacy_root)
-    calendar = ChinaTradingCalendar(legacy_root)
-    stock = finder.retrieve_asset("000001.SZ")
-    portal = TushareDataPortal(legacy_root, finder, calendar, "raw", "2024-01-08")
-    assert portal.value(stock, "2024-01-02", "close") == 10.0
-    with pytest.raises(DataError, match="does not contain PIT index constituents"):
-        portal.index_constituents("000300.SH", "2024-01-03")
-    portal.close()
+
+def test_portal_rejects_mixed_hdf5_generation(data_root: Path, tmp_path: Path) -> None:
+    mixed_root = tmp_path / "mixed-generation"
+    mixed_path = mixed_root / "bundle"
+    shutil.copytree(latest_bundle_path(data_root), mixed_path)
+    with h5py.File(mixed_path / "daily.h5", "r+") as handle:
+        handle.attrs["generation"] = "stale-generation"
+    with pytest.raises(DataError, match="incomplete"):
+        AssetFinder(mixed_root)
 
 
 def test_portal_rejects_mixed_bundle_generations(data_root: Path) -> None:
@@ -181,13 +254,8 @@ def test_portal_rejects_mixed_bundle_generations(data_root: Path) -> None:
         TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
 
 
-def test_runtime_does_not_open_duckdb(
-    data_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def fail(*args: object, **kwargs: object) -> None:
-        raise AssertionError("runtime must not connect to DuckDB")
-
-    monkeypatch.setattr(duckdb, "connect", fail)
+def test_runtime_has_no_duckdb_dependency(data_root: Path) -> None:
+    assert find_spec("duckdb") is None
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)
     stock = finder.retrieve_asset("000001.SZ")
@@ -237,7 +305,7 @@ def test_qfq_hfq_and_history_are_point_in_time(data_root: Path) -> None:
     benchmark = qfq.benchmark_returns("000985.CSI", benchmark_sessions)
     assert benchmark.iloc[0] == 0.0
     assert benchmark.iloc[-1] == pytest.approx(104 / 103 - 1)
-    with pytest.raises(DataError, match="fewer than two"):
+    with pytest.raises(DataError, match="unavailable"):
         qfq.benchmark_returns("MISSING.INDEX", benchmark_sessions)
     qfq.close()
     hfq.close()

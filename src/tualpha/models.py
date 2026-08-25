@@ -139,14 +139,26 @@ class Position:
     asset: Asset
     lots: list[PositionLot] = field(default_factory=list)
     last_sale_price: float = 0.0
+    _cached_amount: float | None = field(default=None, init=False, repr=False)
+    _cached_total_cost: float | None = field(default=None, init=False, repr=False)
+
+    def _invalidate_totals(self) -> None:
+        self._cached_amount = None
+        self._cached_total_cost = None
 
     @property
     def amount(self) -> float:
-        return sum(lot.quantity for lot in self.lots)
+        if self._cached_amount is None:
+            self._cached_amount = sum(lot.quantity for lot in self.lots)
+        return self._cached_amount
 
     @property
     def total_cost(self) -> float:
-        return sum(lot.quantity * lot.unit_cost for lot in self.lots)
+        if self._cached_total_cost is None:
+            self._cached_total_cost = sum(
+                lot.quantity * lot.unit_cost for lot in self.lots
+            )
+        return self._cached_total_cost
 
     @property
     def cost_basis(self) -> float:
@@ -171,6 +183,7 @@ class Position:
                 settle_session=settle_session,
             )
         )
+        self._invalidate_totals()
 
     def apply_adjustment(self, ratio: float) -> None:
         if ratio <= 0:
@@ -179,6 +192,7 @@ class Position:
             return
         for lot in self.lots:
             lot.apply_adjustment(ratio)
+        self._invalidate_totals()
 
     def consume(
         self, quantity: float, session: pd.Timestamp
@@ -201,6 +215,7 @@ class Position:
         if remaining > 1e-6:
             raise ValueError("sell quantity exceeds settled position")
         self.lots = new_lots
+        self._invalidate_totals()
         return consumed
 
 

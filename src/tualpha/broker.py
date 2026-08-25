@@ -49,6 +49,7 @@ class SimulationBroker:
         self.market_rules = market_rules
         self.execution_field = execution_field
         self.orders: list[Order] = []
+        self._open_orders: dict[int, Order] = {}
         self.transactions: list[Transaction] = []
         self.closed_trades: list[ClosedTrade] = []
         self._fees_by_session: dict[pd.Timestamp, FeeBreakdown] = defaultdict(
@@ -74,32 +75,52 @@ class SimulationBroker:
         elif abs(numeric_amount) <= _EPSILON:
             order.reject(RejectReason.ZERO_AMOUNT, "委托数量为零")
         self.orders.append(order)
+        if order.open:
+            self._open_orders[order.id] = order
         return order
 
     def cancel(self, order: Order) -> None:
         if order.open:
             order.status = OrderStatus.CANCELED
             order.message = "用户撤单"
+            self._open_orders.pop(order.id, None)
 
     def get_open_orders(self, asset: Asset | None = None) -> list[Order]:
         return [
             order
-            for order in self.orders
+            for order in self._open_orders.values()
             if order.open and (asset is None or order.asset == asset)
         ]
 
     def apply_corporate_actions(
         self, previous_session: pd.Timestamp | None, session: pd.Timestamp
     ) -> None:
-        """Apply Tushare's dividend-reinvestment factor to existing lots."""
+        """Adjust existing lots and preserve pending full-liquidation intent."""
 
         if previous_session is None:
             return
-        for asset in tuple(self.portfolio.positions):
+        open_sells: dict[Asset, list[Order]] = defaultdict(list)
+        for order in self._open_orders.values():
+            if order.open and order.is_sell:
+                open_sells[order.asset].append(order)
+        for asset, position in tuple(self.portfolio.positions.items()):
             previous_factor = self.data_portal.factor(asset, previous_session)
             current_factor = self.data_portal.factor(asset, session)
-            if previous_factor > 0 and current_factor > 0:
-                self.portfolio.apply_adjustment(asset, current_factor / previous_factor)
+            if previous_factor <= 0 or current_factor <= 0:
+                continue
+            ratio = current_factor / previous_factor
+            if abs(ratio - 1.0) <= _EPSILON:
+                continue
+            previous_amount = position.amount
+            liquidation_orders = [
+                order
+                for order in open_sells.get(asset, ())
+                if abs(abs(order.remaining) - previous_amount) <= _EPSILON
+            ]
+            self.portfolio.apply_adjustment(asset, ratio)
+            adjusted_amount = position.amount
+            for order in liquidation_orders:
+                order.amount = order.filled - adjusted_amount
 
     def _reject(self, order: Order, failure: tuple[RejectReason, str] | None) -> bool:
         if failure is None:
@@ -134,16 +155,24 @@ class SimulationBroker:
 
     def process_orders(self, session: pd.Timestamp) -> list[Transaction]:
         fills: list[Transaction] = []
-        for order in self.orders:
-            if not order.open or order.eligible_session > session:
-                continue
+        eligible = [
+            order
+            for order in self._open_orders.values()
+            if order.open and order.eligible_session <= session
+        ]
+        bars = self.data_portal.execution_bars(
+            list(dict.fromkeys(order.asset for order in eligible)),
+            session,
+            self.execution_field,
+        )
+        for order in eligible:
             asset = order.asset
             if not asset.is_alive_on(session):
                 order.reject(
                     RejectReason.ASSET_NOT_ALIVE, "证券在成交日尚未上市或已经退市"
                 )
                 continue
-            bar = self.data_portal.raw_bar(asset, session)
+            bar = bars.get(asset)
             if self._reject(
                 order,
                 self.market_rules.validate_market(
@@ -232,6 +261,9 @@ class SimulationBroker:
             if order.status is OrderStatus.PARTIALLY_FILLED:
                 order.message = "受可用现金限制，订单按有效交易单位部分成交"
             fills.append(transaction)
+        for order in eligible:
+            if not order.open:
+                self._open_orders.pop(order.id, None)
         return fills
 
     def _apply_buy(self, transaction: Transaction) -> None:
@@ -279,15 +311,29 @@ class SimulationBroker:
                 )
             )
         position.last_sale_price = transaction.price
-        self.portfolio.remove_empty_positions()
+        if position.amount <= _EPSILON:
+            self.portfolio.positions.pop(asset, None)
 
     def mark_to_market(self, session: pd.Timestamp) -> None:
+        positions = list(self.portfolio.positions.items())
+        active_assets = [
+            asset
+            for asset, _ in positions
+            if asset.delist_date is None or session <= asset.delist_date
+        ]
+        closes = self.data_portal.values(
+            active_assets,
+            session,
+            ["close"],
+            adjusted=False,
+        )["close"]
+        close_by_asset = dict(zip(active_assets, closes, strict=True))
         prices = {}
-        for asset, position in self.portfolio.positions.items():
+        for asset, position in positions:
             if asset.delist_date is not None and session > asset.delist_date:
                 prices[asset] = 0.0
                 continue
-            price = self.data_portal.value(asset, session, "close", adjusted=False)
+            price = close_by_asset.get(asset, float("nan"))
             if pd.notna(price) and price > 0:
                 prices[asset] = float(price)
             else:
@@ -300,11 +346,12 @@ class SimulationBroker:
         return self._fees_by_session.get(session, FeeBreakdown())
 
     def cancel_remaining(self) -> None:
-        for order in self.orders:
+        for order in tuple(self._open_orders.values()):
             if order.open:
                 order.cancel(
                     RejectReason.END_OF_BACKTEST, "回测结束，订单未进入可成交交易日"
                 )
+        self._open_orders.clear()
 
     @property
     def total_fees(self) -> FeeBreakdown:

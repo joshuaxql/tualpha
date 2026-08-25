@@ -18,7 +18,7 @@ metadata:
    - [策略 API 参考](references/api-reference.md)
 3. 使用扩展日线或财务因子时，再阅读 [数据字段参考](references/data-fields.md)。
 4. 若代码库版本或 API 可能已经变化，检查 `pyproject.toml`、`README.md` 和实际源码；源码优先于本 Skill。
-5. 不读取策略日期之后的数据，不从 CSV、`normalized.duckdb`、`finance.sqlite` 或 Bcolz 物理文件绕过 DataPortal。
+5. 不读取策略日期之后的数据，不从 CSV、HDF5、`trade_dates.npy` 或 `assets.pk` 物理文件绕过 DataPortal。
 
 ## 需求澄清
 
@@ -54,7 +54,7 @@ D 日进入 handle_data
 - 用 D+1 开盘价决定 D 日订单；
 - 用今天的行业或 ST 状态覆盖历史；
 - 按报告期直接读取尚未公告的财务数据；
-- 在策略中手工读取 CSV、SQLite、DuckDB 或 Bcolz；
+- 在策略中手工读取 CSV、HDF5、NumPy 或 Pickle Bundle 文件；
 - 假设订单一定成交后立即修改“已持仓”状态。
 
 ### 2. 选择最小可行结构
