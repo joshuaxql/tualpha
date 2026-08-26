@@ -190,6 +190,8 @@ class CsvUpdateWriter:
                 "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
                 "complete": False,
                 "target_dates": [int(value) for value in target_dates],
+                "target_dates_by_dataset": {},
+                "safe_end": None,
                 "index_weight_coverage": {},
                 "source_orders": {},
                 "batch_count": 0,
@@ -244,6 +246,28 @@ class CsvUpdateWriter:
         if existing and existing != values:
             raise DataError("CSV cache target dates cannot change during an update")
         self._metadata["target_dates"] = values
+        self._write_metadata()
+
+    def set_target_dates_by_dataset(
+        self,
+        dates_by_dataset: Mapping[str, Sequence[str]],
+        *,
+        safe_end: str,
+    ) -> None:
+        normalized = {
+            str(dataset): [int(value) for value in dates]
+            for dataset, dates in sorted(dates_by_dataset.items())
+        }
+        existing = self._metadata.get("target_dates_by_dataset", {})
+        if existing and existing != normalized:
+            raise DataError(
+                "CSV cache dataset target dates cannot change during an update"
+            )
+        existing_end = self._metadata.get("safe_end")
+        if existing_end and str(existing_end) != str(safe_end):
+            raise DataError("CSV cache safe end cannot change during an update")
+        self._metadata["target_dates_by_dataset"] = normalized
+        self._metadata["safe_end"] = int(safe_end)
         self._write_metadata()
 
     def set_index_coverage(self, coverage: Mapping[str, Any]) -> None:

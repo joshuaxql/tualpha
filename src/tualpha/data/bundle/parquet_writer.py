@@ -51,6 +51,20 @@ from .parquet_store import (
 )
 from .registry import BundleBuildResult
 
+DAILY_DATASET_BY_TABLE = {
+    STOCK_DAILY.name: "daily",
+    ETF_DAILY.name: "fund_daily",
+    INDEX_DAILY.name: "index_daily",
+    ADJ_FACTOR.name: "adj_factor",
+    ETF_ADJ_FACTOR.name: "fund_adj",
+    DAILY_BASIC.name: "daily_basic",
+    MONEYFLOW.name: "moneyflow",
+    STK_LIMIT.name: "stk_limit",
+    SUSPEND_D.name: "suspend_d",
+    STOCK_ST.name: "stock_st",
+    INDUSTRY.name: "industry",
+}
+
 
 class ParquetBuild:
     def __init__(self, result: BundleBuildResult, manifest: dict[str, object]):
@@ -413,12 +427,23 @@ def build_parquet_bundle(
     )
     metadata = json.loads((cache / "cache-manifest.json").read_text(encoding="utf-8"))
     target_dates = {str(value) for value in metadata.get("target_dates", [])}
-    if not target_dates:
-        raise DataError("update cache contains no target dates")
-    calendar = _merge_calendar(staged, trade_cal, max(target_dates))
+    raw_targets = metadata.get("target_dates_by_dataset", {})
+    targets_by_dataset = (
+        {
+            str(dataset): {str(value) for value in values}
+            for dataset, values in raw_targets.items()
+        }
+        if isinstance(raw_targets, dict) and raw_targets
+        else {}
+    )
+    safe_end = str(metadata.get("safe_end") or "")
+    if not safe_end:
+        if not target_dates:
+            raise DataError("update cache contains neither target dates nor safe end")
+        safe_end = max(target_dates)
+    calendar = _merge_calendar(staged, trade_cal, safe_end)
     changed.add(parquet_relative_path(TRADE_CAL, exchange="SSE").as_posix())
 
-    years = sorted({date[:4] for date in target_dates})
     etf_codes = set(etf["ts_code"].astype(str).str.upper())
     daily_specs = (
         STOCK_DAILY,
@@ -434,9 +459,16 @@ def build_parquet_bundle(
         INDUSTRY,
     )
     for spec in daily_specs:
+        spec_target_dates = targets_by_dataset.get(
+            DAILY_DATASET_BY_TABLE[spec.name], target_dates
+        )
+        if not spec_target_dates:
+            continue
         incoming = _daily_incoming(cache, spec, etf_codes)
-        for year in years:
-            _replace_daily_year(staged, spec, year, target_dates, incoming, changed)
+        for year in sorted({date[:4] for date in spec_target_dates}):
+            _replace_daily_year(
+                staged, spec, year, spec_target_dates, incoming, changed
+            )
     _merge_finance(staged, cache, changed)
     _merge_index_weights(staged, cache, changed)
     _validate_critical_data(staged)

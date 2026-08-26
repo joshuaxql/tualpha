@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pandas as pd
 from filelock import FileLock
 from tqdm.auto import tqdm
@@ -29,8 +30,8 @@ from ..tushare_fields import FINANCIAL_FIELDS
 from .calendar_store import normalize_trade_calendar
 from .csv_cache import CSV_CACHE_PROTOCOL, CsvUpdateWriter
 from .manager import BUNDLE_NAME, update_status_path, validate_bundle_name
-from .parquet_schema import INDEX_DAILY_CODES
-from .parquet_store import load_manifest, sha256_file
+from .parquet_schema import INDEX_DAILY_CODES, TABLE_SPECS
+from .parquet_store import PARQUET_DIRECTORY, load_manifest, sha256_file
 from .parquet_writer import (
     active_index_weight_state,
     active_trade_dates,
@@ -38,7 +39,7 @@ from .parquet_writer import (
     find_active_bundle,
 )
 
-UPDATE_SCHEMA_VERSION = 6
+UPDATE_SCHEMA_VERSION = 7
 INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION = 1
 DEFAULT_INDEX_WEIGHT_CODES = (
     "000300.SH",
@@ -48,6 +49,7 @@ DEFAULT_INDEX_WEIGHT_CODES = (
     "899050.BJ",
 )
 DAILY_KEY_COLUMNS = ("ts_code", "trade_date")
+DAILY_DATA_READY_HOUR = 17
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,19 @@ DAILY_DATASETS = (
     DailyDataset("stock_st", "stock_st", 1000, allow_empty=True),
     DailyDataset("index_daily", "index_daily", 6000),
 )
+DAILY_DATASET_TABLES = {
+    "daily": "stock_daily",
+    "adj_factor": "adj_factor",
+    "fund_daily": "etf_daily",
+    "fund_adj": "etf_adj_factor",
+    "daily_basic": "daily_basic",
+    "moneyflow": "moneyflow",
+    "stk_limit": "stk_limit",
+    "suspend_d": "suspend_d",
+    "stock_st": "stock_st",
+    "index_daily": "index_daily",
+    "industry": "industry",
+}
 FINANCIAL_DATASETS = {
     "balancesheet": "balancesheet_vip",
     "income": "income_vip",
@@ -145,6 +160,10 @@ def _concat_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     return result.reindex(columns=columns)
 
 
+def _shanghai_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
 class ProClient(Protocol):
     def query(self, api_name: str, **params: Any) -> pd.DataFrame: ...
 
@@ -170,7 +189,7 @@ class UpdateOptions:
     start: str | None = None
     end: str | None = None
     repair_from: str | None = None
-    lookback: int = 10
+    lookback: int = 0
     retries: int = 3
     backoff: float = 2.0
     dry_run: bool = False
@@ -387,7 +406,7 @@ class DataUpdater:
         if index.empty:
             raise DataError("index_basic returned no indices")
 
-        today = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
+        today = pd.Timestamp(_shanghai_now()).tz_localize(None).normalize()
         requested_starts = [today - pd.DateOffset(years=1)]
         if len(active_sessions):
             requested_starts.append(
@@ -420,14 +439,16 @@ class DataUpdater:
         return MasterData(stock=stock, etf=etf, index=index, trade_cal=trade_cal)
 
     def _safe_end_date(self, trade_cal: pd.DataFrame) -> str:
-        today = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y%m%d")
+        now = _shanghai_now()
+        today = now.strftime("%Y%m%d")
+        include_today = now.hour >= DAILY_DATA_READY_HOUR
         open_dates = sorted(
             {
                 str(value)
                 for value in trade_cal.loc[
                     trade_cal["is_open"].astype(str) == "1", "cal_date"
                 ]
-                if str(value) < today
+                if str(value) < today or (include_today and str(value) == today)
             }
         )
         if not open_dates:
@@ -438,13 +459,9 @@ class DataUpdater:
             raise DataError(f"no completed trading session on or before {requested}")
         return candidates[-1]
 
-    def _target_dates(
-        self,
-        trade_cal: pd.DataFrame,
-        safe_end: str,
-        active_sessions: pd.DatetimeIndex,
-    ) -> list[str]:
-        open_dates = sorted(
+    @staticmethod
+    def _open_dates(trade_cal: pd.DataFrame, safe_end: str) -> list[str]:
+        return sorted(
             {
                 str(value)
                 for value in trade_cal.loc[
@@ -453,8 +470,33 @@ class DataUpdater:
                 if str(value) <= safe_end
             }
         )
-        if not open_dates:
-            raise DataError("trade calendar has no target sessions")
+
+    def _active_daily_dates(self) -> dict[str, set[str]]:
+        active = find_active_bundle(self.options.bundle_root, self.options.bundle_name)
+        if active is None:
+            return {}
+        connection = duckdb.connect()
+        try:
+            result: dict[str, set[str]] = {}
+            for dataset, table in DAILY_DATASET_TABLES.items():
+                pattern = active / PARQUET_DIRECTORY / TABLE_SPECS[table].parquet_glob
+                result[dataset] = {
+                    str(value[0])
+                    for value in connection.execute(
+                        "SELECT DISTINCT trade_date FROM "
+                        "read_parquet(?, hive_partitioning=true)",
+                        [str(pattern)],
+                    ).fetchall()
+                }
+            return result
+        finally:
+            connection.close()
+
+    def _forced_target_dates(
+        self,
+        open_dates: Sequence[str],
+        active_sessions: pd.DatetimeIndex,
+    ) -> list[str] | None:
         if self.options.full:
             if self.options.start:
                 start = self.options.start
@@ -468,43 +510,88 @@ class DataUpdater:
             start = self.options.start
         elif self.options.repair_from:
             start = self.options.repair_from
+        elif self.options.lookback > 0:
+            start = open_dates[max(0, len(open_dates) - self.options.lookback)]
         elif not len(active_sessions):
             start = open_dates[0]
         else:
-            position = (
-                len(open_dates) - 1
-                if self.options.lookback == 0
-                else max(0, len(open_dates) - self.options.lookback)
-            )
-            active_end = active_sessions[-1].strftime("%Y%m%d")
-            start = min(active_end, open_dates[position])
-        return [date for date in open_dates if start <= date <= safe_end]
+            return None
+        return [date for date in open_dates if start <= date]
+
+    def _target_daily_dates(
+        self,
+        trade_cal: pd.DataFrame,
+        safe_end: str,
+        active_sessions: pd.DatetimeIndex,
+    ) -> dict[str, list[str]]:
+        open_dates = self._open_dates(trade_cal, safe_end)
+        if not open_dates:
+            raise DataError("trade calendar has no target sessions")
+        datasets = tuple(DAILY_DATASET_TABLES)
+        forced = self._forced_target_dates(open_dates, active_sessions)
+        if forced is not None:
+            return {dataset: list(forced) for dataset in datasets}
+
+        active_date_text = {
+            session.strftime("%Y%m%d")
+            for session in active_sessions
+            if session.strftime("%Y%m%d") <= safe_end
+        }
+        active_end = max(active_date_text)
+        new_dates = [date for date in open_dates if date > active_end]
+        coverage = self._active_daily_dates()
+        optional = {spec.directory for spec in DAILY_DATASETS if spec.allow_empty}
+        targets: dict[str, list[str]] = {}
+        for dataset in datasets:
+            if dataset in optional:
+                targets[dataset] = list(new_dates)
+                continue
+            covered = coverage.get(dataset, set())
+            historical_missing: list[str] = []
+            if covered:
+                first_covered = min(covered)
+                historical_missing = [
+                    date
+                    for date in open_dates
+                    if first_covered <= date <= active_end
+                    and date in active_date_text
+                    and date not in covered
+                ]
+            targets[dataset] = list(dict.fromkeys((*historical_missing, *new_dates)))
+        return targets
 
     def _download_daily_partitions(
         self,
-        dates: Sequence[str],
+        dates_by_dataset: dict[str, list[str]],
         writer: CsvUpdateWriter,
     ) -> None:
-        current_partition = "masters/industry/current"
-        if writer.has_partition(current_partition):
-            current_industry = writer.read_raw_partition(current_partition)
-        else:
-            current_industry = self._fetch_paginated(
-                "index_member_all", {"is_new": "Y"}, 2000
+        date_sets = {dataset: set(dates) for dataset, dates in dates_by_dataset.items()}
+        dates = sorted(set().union(*date_sets.values())) if date_sets else []
+        industry_dates = date_sets.get("industry", set())
+        industry = pd.DataFrame()
+        if industry_dates:
+            current_partition = "masters/industry/current"
+            if writer.has_partition(current_partition):
+                current_industry = writer.read_raw_partition(current_partition)
+            else:
+                current_industry = self._fetch_paginated(
+                    "index_member_all", {"is_new": "Y"}, 2000
+                )
+                writer.write_raw_partition(current_partition, current_industry)
+            historical_partition = "masters/industry/historical"
+            if writer.has_partition(historical_partition):
+                historical_industry = writer.read_raw_partition(historical_partition)
+            else:
+                historical_industry = self._fetch_paginated(
+                    "index_member_all", {"is_new": "N"}, 2000
+                )
+                writer.write_raw_partition(historical_partition, historical_industry)
+            industry = _concat_frames([current_industry, historical_industry])
+            industry = self._normalize_frame(
+                industry, ["ts_code", "in_date", "out_date"]
             )
-            writer.write_raw_partition(current_partition, current_industry)
-        historical_partition = "masters/industry/historical"
-        if writer.has_partition(historical_partition):
-            historical_industry = writer.read_raw_partition(historical_partition)
-        else:
-            historical_industry = self._fetch_paginated(
-                "index_member_all", {"is_new": "N"}, 2000
-            )
-            writer.write_raw_partition(historical_partition, historical_industry)
-        industry = _concat_frames([current_industry, historical_industry])
-        industry = self._normalize_frame(industry, ["ts_code", "in_date", "out_date"])
-        if dates and industry.empty:
-            raise DataError("index_member_all returned no industry members")
+            if industry.empty:
+                raise DataError("index_member_all returned no industry members")
 
         for date in tqdm(
             dates,
@@ -516,6 +603,8 @@ class DataUpdater:
             disable=not self.options.show_progress,
         ):
             for spec in DAILY_DATASETS:
+                if date not in date_sets.get(spec.directory, set()):
+                    continue
                 partition = f"daily/{spec.directory}/{date}"
                 if writer.has_partition(partition):
                     continue
@@ -552,6 +641,8 @@ class DataUpdater:
                 else:
                     writer.append_daily_role(spec.directory, frame, partition=partition)
 
+            if date not in industry_dates:
+                continue
             industry_partition = f"daily/industry/{date}"
             if writer.has_partition(industry_partition):
                 continue
@@ -616,23 +707,12 @@ class DataUpdater:
             )
         }
 
-    @staticmethod
-    def _incremental_financial_periods(safe_end: str) -> list[str]:
-        """Return report periods expected to be publishing on the update date."""
+    @classmethod
+    def _incremental_financial_periods(cls, safe_end: str) -> list[str]:
+        """Return the latest two completed report quarters."""
 
         end = pd.to_datetime(safe_end, format="%Y%m%d")
-        year = end.year
-        month_day = (end.month, end.day)
-        annual = f"{year - 1}1231"
-        if (1, 1) <= month_day < (4, 1):
-            return [annual]
-        if (4, 1) <= month_day <= (4, 30):
-            return [annual, f"{year}0331"]
-        if (7, 1) <= month_day <= (8, 31):
-            return [f"{year}0630"]
-        if (10, 1) <= month_day <= (10, 31):
-            return [f"{year}0930"]
-        return []
+        return cls._recent_quarter_ends(end, count=2)
 
     def _download_financials(
         self,
@@ -648,17 +728,11 @@ class DataUpdater:
                 for period in periods
             ]
         else:
-            announcement_start = (
-                pd.to_datetime(safe_end, format="%Y%m%d") - pd.DateOffset(days=120)
-            ).strftime("%Y%m%d")
+            periods = self._incremental_financial_periods(safe_end)
             requests = [
-                (
-                    directory,
-                    api_name,
-                    {"start_date": announcement_start, "end_date": safe_end},
-                    f"ann-{announcement_start}-{safe_end}",
-                )
+                (directory, api_name, {"period": period}, period)
                 for directory, api_name in FINANCIAL_DATASETS.items()
+                for period in periods
             ]
         datasets = tqdm(
             requests,
@@ -910,6 +984,7 @@ class DataUpdater:
 
         signature_matches = all(
             (
+                int(status.get("schema_version", -1)) == UPDATE_SCHEMA_VERSION,
                 status.get("requested_start") == self.options.start,
                 status.get("requested_end") == self.options.end,
                 status.get("repair_from") == self.options.repair_from,
@@ -1071,17 +1146,20 @@ class DataUpdater:
                 ) as writer:
                     masters = self._refresh_masters(active_sessions, writer)
                     safe_end = self._safe_end_date(masters.trade_cal)
-                    dates = self._target_dates(
+                    dates_by_dataset = self._target_daily_dates(
                         masters.trade_cal, safe_end, active_sessions
                     )
-                    if not dates:
-                        raise DataError("update request contains no open trading dates")
+                    dates = sorted(set().union(*map(set, dates_by_dataset.values())))
                     writer.set_target_dates(dates)
+                    writer.set_target_dates_by_dataset(
+                        dates_by_dataset, safe_end=safe_end
+                    )
                     progress.update(1)
                     progress.set_postfix_str(
-                        f"下载 {len(dates)} 个交易日的日频数据", refresh=True
+                        f"下载 {len(dates)} 个缺失交易日的日频数据",
+                        refresh=True,
                     )
-                    self._download_daily_partitions(dates, writer)
+                    self._download_daily_partitions(dates_by_dataset, writer)
                     progress.update(1)
                     progress.set_postfix_str("下载 PIT 财务数据", refresh=True)
                     financial_full_start = full_start or (
@@ -1114,6 +1192,7 @@ class DataUpdater:
                             "storage": "partitioned-csv-cache",
                             "downloaded_batches": batch_count,
                             "updated_dates": dates,
+                            "updated_dates_by_dataset": dates_by_dataset,
                             "cache_manifest_sha256": sha256_file(
                                 cache_path / "cache-manifest.json"
                             ),

@@ -62,7 +62,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="accepted for compatibility; yearly Parquet needs no compaction",
     )
-    update.add_argument("--lookback", type=int, default=10)
+    update.add_argument(
+        "--lookback",
+        type=int,
+        default=0,
+        help="explicitly refresh the latest N open sessions (default: missing data only)",
+    )
     update.add_argument("--retries", type=int, default=3)
     update.add_argument("--backoff", type=float, default=2.0)
     update.add_argument("--token-stdin", action="store_true")

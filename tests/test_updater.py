@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -12,6 +14,7 @@ from tualpha import local_data
 from tualpha.bundle import bundle_path, load_bundle_data, update_status_path
 from tualpha.cli import run_cli
 from tualpha.data.bundle.parquet_store import load_manifest
+from tualpha.data.bundle.updater import DAILY_DATASETS
 from tualpha.exceptions import ConfigurationError, DataError
 from tualpha.updater import (
     DEFAULT_INDEX_WEIGHT_CODES,
@@ -109,6 +112,105 @@ def test_update_requires_token_without_injected_client(
     assert run_cli(["update", "--bundle-root", str(tmp_path)]) == 2
 
 
+def test_safe_end_includes_current_open_date_from_1700(
+    csv_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    updater = DataUpdater(
+        UpdateOptions(bundle_root=tmp_path / "root", retries=1),
+        client=FakeProClient(csv_dir),
+    )
+    calendar = pd.DataFrame(
+        {
+            "cal_date": ["20240105", "20240106", "20240107", "20240108"],
+            "is_open": ["1", "0", "0", "1"],
+        }
+    )
+    timezone = ZoneInfo("Asia/Shanghai")
+
+    monkeypatch.setattr(
+        "tualpha.data.bundle.updater._shanghai_now",
+        lambda: datetime(2024, 1, 8, 16, 59, 59, tzinfo=timezone),
+    )
+    assert updater._safe_end_date(calendar) == "20240105"
+
+    monkeypatch.setattr(
+        "tualpha.data.bundle.updater._shanghai_now",
+        lambda: datetime(2024, 1, 8, 17, 0, 0, tzinfo=timezone),
+    )
+    assert updater._safe_end_date(calendar) == "20240108"
+
+
+def test_incremental_update_skips_complete_daily_datasets(
+    csv_dir: Path, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    _build(csv_dir, root)
+    client = FakeProClient(csv_dir)
+
+    result = DataUpdater(
+        UpdateOptions(
+            bundle_root=root,
+            lookback=0,
+            retries=1,
+            show_progress=False,
+        ),
+        client=client,
+    ).run()
+
+    daily_apis = {spec.api_name for spec in DAILY_DATASETS}
+    daily_calls = [
+        (name, params)
+        for name, params in client.calls
+        if name in daily_apis and "trade_date" in params
+    ]
+    assert result.updated_dates == ()
+    assert daily_calls == []
+
+
+def test_incremental_update_downloads_only_missing_daily_dataset(
+    csv_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    _build(csv_dir, root)
+    client = FakeProClient(csv_dir)
+    updater = DataUpdater(
+        UpdateOptions(
+            bundle_root=root,
+            lookback=0,
+            retries=1,
+            show_progress=False,
+        ),
+        client=client,
+    )
+    coverage = updater._active_daily_dates()
+    coverage["daily"].remove("20240104")
+    monkeypatch.setattr(updater, "_active_daily_dates", lambda: coverage)
+
+    result = updater.run()
+
+    daily_apis = {spec.api_name for spec in DAILY_DATASETS}
+    daily_calls = [
+        (name, params["trade_date"])
+        for name, params in client.calls
+        if name in daily_apis and "trade_date" in params
+    ]
+    assert result.updated_dates == ("20240104",)
+    assert daily_calls == [("daily", "20240104")]
+    with local_data(root) as query:
+        assert (
+            query.sql(
+                "SELECT count(*) FROM stock_daily WHERE trade_date='20240104'"
+            ).iloc[0, 0]
+            == 2
+        )
+        assert (
+            query.sql(
+                "SELECT count(*) FROM etf_daily WHERE trade_date='20240104'"
+            ).iloc[0, 0]
+            == 2
+        )
+
+
 def test_incremental_index_weight_refresh_does_not_redownload_full_history(
     csv_dir: Path, tmp_path: Path
 ) -> None:
@@ -123,7 +225,7 @@ def test_incremental_index_weight_refresh_does_not_redownload_full_history(
     )
 
 
-def test_incremental_financial_update_uses_announcement_lookback(
+def test_incremental_financial_update_fetches_latest_two_quarters(
     csv_dir: Path, tmp_path: Path
 ) -> None:
     client = FakeProClient(csv_dir)
@@ -134,10 +236,22 @@ def test_incremental_financial_update_uses_announcement_lookback(
         updater._download_financials(writer, "20240415", None)
 
     calls = [params for name, params in client.calls if name.endswith("_vip")]
-    assert len(calls) == 4
-    assert {params["start_date"] for params in calls} == {"20231217"}
-    assert {params["end_date"] for params in calls} == {"20240415"}
-    assert all("period" not in params for params in calls)
+    assert len(calls) == 8
+    assert {params["period"] for params in calls} == {"20231231", "20240331"}
+    assert all(
+        "start_date" not in params and "end_date" not in params for params in calls
+    )
+
+
+def test_incremental_financial_periods_follow_completed_quarters() -> None:
+    assert DataUpdater._incremental_financial_periods("20240115") == [
+        "20230930",
+        "20231231",
+    ]
+    assert DataUpdater._incremental_financial_periods("20240701") == [
+        "20240331",
+        "20240630",
+    ]
 
 
 def test_initial_online_update_builds_parquet_bundle(
