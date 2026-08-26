@@ -21,6 +21,13 @@ def _sql_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/").replace("'", "''")
 
 
+def _text_or(value: object, default: str) -> str:
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip()
+    return default if text.lower() in {"", "nan", "nat", "none"} else text
+
+
 def _existing_sid_map(active_bundle: Path) -> dict[str, int]:
     catalog = active_bundle / CATALOG_FILE
     if catalog.is_file():
@@ -95,8 +102,8 @@ def build_asset_table(
         observed = bounds.get(("stock", code))
         if not code or observed is None:
             continue
-        list_date = str(row.get("list_date") or observed[0])
-        delist_date = str(row.get("delist_date") or end_session)
+        list_date = _text_or(row.get("list_date"), observed[0])
+        delist_date = _text_or(row.get("delist_date"), end_session)
         first = max(start_session, list_date, observed[0])
         last = min(end_session, delist_date)
         if first > last:
@@ -129,9 +136,11 @@ def build_asset_table(
         observed = bounds.get(("etf", code))
         if not code or observed is None:
             continue
-        list_date = str(row.get("list_date") or observed[0])
+        list_date = _text_or(row.get("list_date"), observed[0])
         first = max(start_session, list_date, observed[0])
-        last = end_session if str(row.get("list_status", "")) == "L" else observed[1]
+        last = (
+            end_session if _text_or(row.get("list_status"), "") == "L" else observed[1]
+        )
         last = min(end_session, last)
         if first > last:
             continue
@@ -161,11 +170,11 @@ def build_asset_table(
         if not code:
             continue
         observed = bounds.get(("index", code))
-        list_date = str(
-            row.get("list_date") or (observed[0] if observed else start_session)
+        list_date = _text_or(
+            row.get("list_date"), observed[0] if observed else start_session
         )
-        exp_date = str(
-            row.get("exp_date") or (observed[1] if observed else end_session)
+        exp_date = _text_or(
+            row.get("exp_date"), observed[1] if observed else end_session
         )
         records.append(
             {

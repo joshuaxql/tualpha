@@ -99,7 +99,15 @@ class BarData:
                 index=index,
                 name=field_list[0],
             )
-        return pd.DataFrame(values, index=index)
+        columns = {
+            field: (
+                pd.Series(array, index=index, dtype=object)
+                if array.dtype == object
+                else array
+            )
+            for field, array in values.items()
+        }
+        return pd.DataFrame(columns, index=index)
 
     def prefetch(
         self, assets: Asset | Iterable[Asset], fields: str | Iterable[str]

@@ -135,7 +135,10 @@ def _cache_frames(cache_path: Path, key: str) -> pd.DataFrame:
             continue
         path = cache_path / relative
         try:
-            frames.append(pd.read_csv(path, dtype=str, keep_default_na=False))
+            # Pandas 3 infers Arrow-backed ``str`` columns by default. CSV cache
+            # frames are mutable staging data, so keep explicit object columns and
+            # normalize them only at the Parquet schema boundary.
+            frames.append(pd.read_csv(path, dtype=object, keep_default_na=False))
         except pd.errors.EmptyDataError:
             continue
     return (

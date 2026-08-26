@@ -222,23 +222,31 @@ class BundleDataPortal:
                 + self._sessions.day,
                 dtype=np.int32,
             )
-            self._list_dates = np.asarray(
+            self._list_date_ints = np.asarray(
                 [
-                    asset.list_date.value
+                    (
+                        asset.list_date.year * 10_000
+                        + asset.list_date.month * 100
+                        + asset.list_date.day
+                    )
                     if asset.list_date is not None
-                    else np.iinfo(np.int64).min
+                    else np.iinfo(np.int32).min
                     for asset in self._ordered_assets
                 ],
-                dtype=np.int64,
+                dtype=np.int32,
             )
-            self._delist_dates = np.asarray(
+            self._delist_date_ints = np.asarray(
                 [
-                    asset.delist_date.value
+                    (
+                        asset.delist_date.year * 10_000
+                        + asset.delist_date.month * 100
+                        + asset.delist_date.day
+                    )
                     if asset.delist_date is not None
-                    else np.iinfo(np.int64).max
+                    else np.iinfo(np.int32).max
                     for asset in self._ordered_assets
                 ],
-                dtype=np.int64,
+                dtype=np.int32,
             )
             self._column_cache: OrderedDict[str, np.ndarray] = OrderedDict()
             self._column_cache_bytes = 0
@@ -396,11 +404,16 @@ class BundleDataPortal:
         valid_positions = positions >= 0
         result = np.zeros((len(sessions), len(positions)), dtype=bool)
         if valid_positions.any():
-            values = sessions.asi8[:, None]
+            # Pandas 3 preserves/infer datetime resolutions instead of always using
+            # nanoseconds. Compare date ordinals rather than raw ``asi8`` values.
+            values = np.asarray(
+                sessions.year * 10_000 + sessions.month * 100 + sessions.day,
+                dtype=np.int32,
+            )[:, None]
             selected = positions[valid_positions]
             result[:, valid_positions] = (
-                self._list_dates[selected][None, :] <= values
-            ) & (values <= self._delist_dates[selected][None, :])
+                self._list_date_ints[selected][None, :] <= values
+            ) & (values <= self._delist_date_ints[selected][None, :])
         return result
 
     def _cache(self, key: str, values: np.ndarray) -> np.ndarray:
@@ -496,19 +509,29 @@ class BundleDataPortal:
         )
         reader = self._connection.execute(
             query, [*params, *[int(value) for value in missing]]
-        ).fetch_record_batch(rows_per_batch=500_000)
+        ).to_arrow_reader(batch_size=500_000)
         cached.setflags(write=True)
         for batch in reader:
-            frame = batch.to_pandas()
-            date_positions = frame["session_position"].to_numpy(dtype=np.int64)
-            asset_positions = frame["asset_position"].to_numpy(dtype=np.int64)
+            date_positions = np.asarray(
+                batch.column("session_position").to_numpy(zero_copy_only=False),
+                dtype=np.int64,
+            )
+            asset_positions = np.asarray(
+                batch.column("asset_position").to_numpy(zero_copy_only=False),
+                dtype=np.int64,
+            )
             valid = (date_positions >= 0) & (asset_positions >= 0)
+            values = batch.column("value")
             if categorical:
-                text = frame["value"].fillna("").astype(str)
+                text = [
+                    "" if value is None else str(value) for value in values.to_pylist()
+                ]
                 categories = list(self._categories.get(key, ()))
                 known = set(categories)
                 categories.extend(
-                    value for value in text.unique() if value and value not in known
+                    value
+                    for value in dict.fromkeys(text)
+                    if value and value not in known
                 )
                 self._categories[key] = tuple(categories)
                 mapping = {value: index for index, value in enumerate(categories)}
@@ -517,9 +540,7 @@ class BundleDataPortal:
                 )
                 cached[date_positions[valid], asset_positions[valid]] = encoded[valid]
             else:
-                decoded = pd.to_numeric(frame["value"], errors="coerce").to_numpy(
-                    dtype=float
-                )
+                decoded = np.asarray(values.to_numpy(zero_copy_only=False), dtype=float)
                 cached[date_positions[valid], asset_positions[valid]] = decoded[valid]
         loaded[missing] = True
         cached.setflags(write=False)
