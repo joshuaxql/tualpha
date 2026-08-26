@@ -398,7 +398,20 @@ def csv_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
                         1,
                         1000,
                         1000,
-                    ]
+                    ],
+                    [
+                        "399001.SZ",
+                        date,
+                        200 + index,
+                        201 + index,
+                        199 + index,
+                        200 + index,
+                        199 + index,
+                        1,
+                        1,
+                        1000,
+                        1000,
+                    ],
                 ],
                 columns=daily.columns,
             ),
@@ -548,10 +561,22 @@ def csv_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.fixture(scope="session")
 def bundle_root(tmp_path_factory: pytest.TempPathFactory, csv_dir: Path) -> Path:
-    from tualpha.bundle import build_bundle
+    from fakes import FakeProClient
+
+    from tualpha.updater import DataUpdater, UpdateOptions
 
     root = tmp_path_factory.mktemp("bundle_root")
-    build_bundle(csv_dir, bundle_root=root, rebuild_normalized=True)
+    DataUpdater(
+        UpdateOptions(
+            bundle_root=root,
+            start="20240102",
+            end="20240108",
+            full=True,
+            retries=1,
+            show_progress=False,
+        ),
+        client=FakeProClient(csv_dir),
+    ).run()
     return root
 
 

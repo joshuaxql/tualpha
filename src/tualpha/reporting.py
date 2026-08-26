@@ -46,6 +46,7 @@ _REJECTION_LABELS = {
     "no_market_data": "无行情",
     "zero_volume": "零成交量",
     "invalid_lot": "交易单位不合法",
+    "below_minimum_order": "不足最小交易单位",
     "t_plus_one": "T+1 可卖不足",
     "insufficient_cash": "现金不足",
     "insufficient_position": "持仓不足",
@@ -499,9 +500,7 @@ def generate_html_report(result: BacktestResult, path: str | Path) -> Path:
         [
             f"<tr><td>佣金</td><td>{_money(metrics.get('total_commission'))}</td></tr>",
             f"<tr><td>印花税</td><td>{_money(metrics.get('total_stamp_tax'))}</td></tr>",
-            f"<tr><td>另计经手费</td><td>{_money(metrics.get('total_handling_fee'))}</td></tr>",
             f"<tr><td>过户费</td><td>{_money(metrics.get('total_transfer_fee'))}</td></tr>",
-            f"<tr><td>佣金内含经手费（参考）</td><td>{_money(performance['included_handling_fee'].sum())}</td></tr>",
         ]
     )
     start = performance.index.min().date()
@@ -545,7 +544,7 @@ footer{{text-align:center;margin-top:45px;padding-top:18px;border-top:1px solid 
 <div class="table-wrap"><table><thead><tr><th>费用项目</th><th>金额</th></tr></thead><tbody>{fee_rows}</tbody></table></div>
 <div class="table-wrap"><table><thead><tr><th>拒单原因</th><th>次数</th></tr></thead><tbody>{_rejection_rows(result)}</tbody></table></div>
 </div>
-<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>盈亏贡献占比</th><th>几何贡献收益（每日权重贡献累计）</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
+<div class="section-title">组合归因 (Attribution)</div><div class="table-wrap"><table><thead><tr><th>标的</th><th>成交次数</th><th>持有总天数</th><th>已实现盈亏</th><th>盈亏贡献占比</th><th>每日权重贡献累计</th><th>总费用</th></tr></thead><tbody>{_attribution_rows(result)}</tbody></table></div>
 <footer>TuAlpha Report · Powered by Plotly · 股票与 ETF 日频回测</footer>
 </div></body></html>"""
     destination = Path(path)

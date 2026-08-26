@@ -1,6 +1,6 @@
 [project]
 name = "tualpha"
-version = "0.8.1"
+version = "1.3.0"
 description = "Event-driven daily backtesting for China A-share stocks and ETFs"
 readme = "README.md"
 keywords = ["backtest", "quant", "a-share", "etf", "tushare"]
@@ -17,18 +17,25 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "duckdb>=1.4",
     "filelock>=3.16",
-    "h5py>=3.12",
     "numpy>=2.0",
     "pandas>=2.2",
     "plotly>=5.24",
     "polars>=1.20",
+    "pyarrow>=18",
     "tqdm>=4.67",
     "tushare>=1.4",
 ]
 
+[project.urls]
+Homepage = "https://github.com/joshuaxql/tualpha"
+Repository = "https://github.com/joshuaxql/tualpha"
+Documentation = "https://github.com/joshuaxql/tualpha#readme"
+Issues = "https://github.com/joshuaxql/tualpha/issues"
+
 [project.scripts]
-tualpha = "tualpha.cli:main"
+tualpha = "tualpha.cmds.entry:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

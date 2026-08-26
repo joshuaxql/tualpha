@@ -1,29 +1,34 @@
-# TuAlpha
+<h1 align="center">TuAlpha</h1>
 
-TuAlpha 是基于 Tushare 数据、面向中国 A 股股票与 ETF 的日频事件驱动回测框架。框架提供类似 Zipline 的策略 API，但资产、日历、行情、财务和指数权重均由 TuAlpha 自有 HDF5 Reader/Writer 管理。
+<p align="center">
+  面向中国 A 股与 ETF 的日频事件驱动回测框架
+</p>
 
-> 当前开发版本为 `0.8.1`（尚未发布到 PyPI）。仅支持多头现金账户、股票和 ETF；不支持期货、期权、融资融券或 ETF 申赎。
+<p align="center">
+  <a href="https://pypi.org/project/tualpha/">
+    <img src="https://img.shields.io/pypi/v/tualpha?style=flat-square&color=007ec6" alt="PyPI Version">
+  </a>
+  <img src="https://img.shields.io/badge/python-3.12-blue?style=flat-square" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/storage-Parquet%20%2B%20DuckDB-orange?style=flat-square" alt="Parquet and DuckDB">
+  <img src="https://img.shields.io/badge/data-Tushare-green?style=flat-square" alt="Tushare">
+</p>
 
-## 功能
+**TuAlpha** 是一款针对中国 A 股股票与 ETF 的日频量化研究和事件驱动回测框架。它提供简洁的 Python 策略 API，以按年分区的 **Parquet** 作为本地事实数据源，并使用 **DuckDB** 完成查询、分区裁剪和质量检查。
 
-- RQAlpha 风格的 HDF5/NumPy/Pickle 固定 Bundle
-- 常用横截面字段使用同一 HDF5 文件内的 packed 连续数组加速，旧 schema 7 Bundle 可兼容回退
-- 股票、ETF、指数原始日线统一存入 `daily.h5`
-- Tushare SSE `trade_cal` 开放日固化到 `trade_dates.npy`
-- D 日收盘决策，订单最早 D+1 按开盘或收盘价成交
-- 涨停禁止买入、跌停禁止卖出；停牌、无行情、零成交量禁止成交
-- 主板、创业板和 ETF 按 100 股/份交易
-- 科创板 200 股起，之后按 1 股递增；北交所 100 股起，之后按 1 股递增
-- 所有股票和 ETF 统一 T+1
-- 支持印花税、佣金、经手费和过户费
-- 支持 `raw`、`qfq`、`hfq`，策略价格与成交原始价格分离
-- 支持每日指标、资金流、历史行业、历史 ST、PIT 财务和 PIT 指数权重
-- 中文 Plotly HTML 报告、每日持仓 CSV 和每日权重贡献归因
-- `tualpha update` 增量更新原始 CSV 后整体构建并原子发布新 Bundle
+🚀 **核心亮点：**
 
-## 安装
+- **真实市场时序**：D 日读取截至当日的数据并决策，订单最早 D+1 成交；内置 T+1、停牌、涨跌停、交易单位和现金约束。
+- **Point-in-time 数据**：财务数据按公告日期可见，指数成分使用严格早于当前回调日的最新权重快照，避免未来函数。
+- **高效本地数据层**：日频数据按年分区，DuckDB 执行投影和过滤下推；DataPortal 使用列缓存、Arrow 分批读取和固定资产池预取。
+- **原子增量更新**：只重写受影响年度分区，复用未变化文件，并通过 staging、generation、文件锁和 rollback 原子发布。
+- **完整数据质量报告**：覆盖 schema、主键、分区、日期、OHLC、复权、财务 PIT、指数权重和跨表引用，输出 HTML、JSON 与 CSV。
+- **可解释回测结果**：生成中文 Plotly HTML 报告、每日持仓、订单、成交、已平仓交易、组合归因和用户自定义记录。
 
-推荐 64 位 CPython 3.12：
+👉 **[架构说明](docs/architecture.md)** | **[Bundle 格式](docs/bundle-format.md)** | **[策略 Skill](.agents/skills/tualpha-strategy/SKILL.md)**
+
+## 安装说明
+
+TuAlpha 要求 **Python 3.12**，推荐使用 [`uv`](https://docs.astral.sh/uv/) 从 PyPI 安装：
 
 ```bash
 uv add tualpha
@@ -32,100 +37,20 @@ uv add tualpha
 源码开发：
 
 ```bash
+git clone https://github.com/joshuaxql/tualpha.git
+cd tualpha
 uv sync --dev
-uv run pytest
 ```
 
-## 数据目录
-
-默认根目录为 `~/.tualpha`，最终 Bundle 固定为 `~/.tualpha/bundle`：
-
-```text
-~/.tualpha/
-├── bundle/
-│   ├── daily.h5          # 股票、ETF、指数原始日线
-│   ├── adj_factor.h5     # 股票、ETF 复权因子
-│   ├── daily_basic.h5    # 股票每日指标
-│   ├── stk_limit.h5      # 每日涨跌停价格
-│   ├── finance.h5        # 四类财务宽表及 PIT 元数据
-│   ├── industry.h5       # 每日历史行业
-│   ├── stock_st.h5       # 每日历史 ST 状态
-│   ├── moneyflow.h5      # 每日资金流
-│   ├── index_weight.h5   # PIT 指数成分与权重
-│   ├── trade_dates.npy   # Tushare SSE 开放交易日
-│   ├── assets.pk         # 资产信息、generation 和文件清单
-│   └── suspend_d.h5      # 每日停牌状态
-├── update-status.json    # 更新、构建、验证和旧数据清理记录
-├── .locks/               # 更新锁和 Bundle 发布锁
-├── .staging/             # 构建临时区，成功后自动删除
-└── .rollback/            # 发布中断恢复目录
-```
-
-`bundle/` 必须且只能包含上述 12 个文件。
-
-回测只读取最终 Bundle，不读取原始 CSV 或 staging 文件。详细协议见 [`docs/bundle-format.md`](docs/bundle-format.md)。
-
-## 原始 CSV
-
-CSV 目录没有默认值，必须与 Bundle 根目录完全分离，例如：
-
-```text
-E:\data\tushare_data\
-├── daily\YYYYMMDD.csv
-├── fund_daily\YYYYMMDD.csv
-├── index_daily\YYYYMMDD.csv
-├── adj_factor\YYYYMMDD.csv
-├── fund_adj\YYYYMMDD.csv
-├── daily_basic\YYYYMMDD.csv
-├── stk_limit\YYYYMMDD.csv
-├── suspend_d\YYYYMMDD.csv
-├── industry\YYYYMMDD.csv
-├── stock_st\YYYYMMDD.csv
-├── moneyflow\YYYYMMDD.csv
-├── index_weight\YYYYMMDD.csv
-├── balancesheet\*.csv
-├── income\*.csv
-├── cashflow\*.csv
-├── fina_indicator\*.csv
-├── stock_basic.csv
-├── etf_basic.csv
-├── index_basic.csv
-└── trade_cal.csv
-```
-
-## 更新数据
-
-必须通过环境变量提供 Token：
+验证安装：
 
 ```bash
-export TUSHARE_TOKEN="your-token"
-tualpha update --csv-dir /e/data/tushare_data
+uv run python -c "import tualpha; print(tualpha.__version__)"
 ```
-
-常用参数：
-
-```bash
-tualpha update --csv-dir /e/data/tushare_data --from 20260101 --to 20260821
-tualpha update --csv-dir /e/data/tushare_data --repair-from 20250101
-tualpha update --csv-dir /e/data/tushare_data --lookback 20
-tualpha update --csv-dir /e/data/tushare_data --index-weight 000016.SH
-tualpha update --csv-dir /e/data/tushare_data --dry-run --json
-```
-
-更新流程：
-
-1. 增量下载行情、复权、每日指标、资金流、行业、ST、停牌、财务和指数权重 CSV。
-2. 对分页接口检测重复页；按公告日期合并财务历史修订。
-3. 原子发布原始 CSV，失败时根据 journal 恢复。
-4. 将 CSV 流式写入 `.staging` 中按证券代码哈希分桶的临时 Parquet。
-5. 每个桶按 `ts_code + 日期 + source_order` 排序，再一次性写入目标 HDF5 dataset。
-6. 校验 12 文件集合、generation、dtype、日期、PIT 规则、文件大小和 SHA-256。
-7. 持发布锁替换固定 `bundle/`，并从最终路径重新打开验证。
-8. 原子写入 `update-status.json`，成功后删除 staging。
-
-`index_weight` 默认维护 `000300.SH`、`000852.SH`、`000905.SH`、`000906.SH` 和 `899050.BJ`，原始权重单位为百分比。
 
 ## 快速开始
+
+下面是一个 20 日均线 ETF 策略。D 日收盘后计算信号，订单由框架在 D+1 开盘撮合：
 
 ```python
 from tualpha import order_target_percent, record, run_algorithm, symbol
@@ -136,139 +61,258 @@ def initialize(context):
 
 
 def handle_data(context, data):
-    closes = data.history(context.asset, "close", 20)
+    closes = data.history(context.asset, "close", 20).dropna()
     if len(closes) < 20:
+        record(ready=0, target_weight=0.0)
         return
-    target = 0.95 if closes.iloc[-1] > closes.mean() else 0.0
-    order_target_percent(context.asset, target)
-    record(close=closes.iloc[-1], ma20=closes.mean())
+
+    ma20 = float(closes.mean())
+    close = float(closes.iloc[-1])
+    target = 0.95 if close > ma20 else 0.0
+
+    if data.can_trade(context.asset):
+        order_target_percent(context.asset, target)
+
+    record(ready=1, close=close, ma20=ma20, target_weight=target)
 
 
 result = run_algorithm(
     start="2020-01-01",
-    end="2025-12-31",
+    end="2026-08-25",
     initialize=initialize,
     handle_data=handle_data,
     capital_base=1_000_000,
     adjustment="qfq",
     execution_time="open",
     benchmark="000300.SH",
-    output_dir="outputs/demo",
-    strategy_name="沪深300 ETF 趋势策略",
-    column_cache_mib=2048,
+    output_dir="outputs/ma20_etf",
+    strategy_name="沪深300ETF MA20",
 )
+
 print(result.summary())
 ```
 
-策略在 D 日回调中最多读取到 D 日数据，新订单最早 D+1 成交。成交、现金、费用和涨跌停判断始终使用原始价格。
+输出目录：
 
-日频列缓存默认上限为 2,048 MiB，可通过 `run_algorithm(column_cache_mib=...)` 或环境变量 `TUALPHA_COLUMN_CACHE_MIB` 调整。大型固定资产池优先使用 `data.current_arrays()`，它返回与资产顺序一致的只读 NumPy 数组。
-
-## 核心 API
-
-- `symbol(code)`
-- `order()`、`order_value()`、`order_percent()`
-- `order_target()`、`order_target_many()`、`order_target_value()`、`order_target_percent()`
-- 批量目标买单及单笔 `target_value` / `target_percent` 在 D+1 按实际价格与现金缩量；不足最小单位时取消而非现金不足拒单
-- `cancel_order()`、`get_open_orders()`
-- `record(**values)`
-- `data.current()`、`data.current_arrays()`、`data.raw_current()`、`data.history()`
-- `data.fundamental()`、`data.fundamentals()`
-- `data.index_constituents()`
-- `data.available_fields()`
-- `data.can_trade()`
-
-## 日频扩展字段
-
-扩展字段使用 `<数据集>.<字段>`：
-
-```python
-pe_ttm = data.current(context.asset, "daily_basic.pe_ttm")
-net_flow = data.history(context.asset, "moneyflow.net_mf_amount", 20)
-industry = data.current(context.asset, "industry.l1_name")
-is_st = data.current(context.asset, "stock_st.is_st")
+```text
+outputs/ma20_etf/
+├── report.html
+└── daily_positions.csv
 ```
 
-- `daily_basic`：估值、换手率、股本和市值；
-- `moneyflow`：大小单量和金额，量为手、金额为万元；
-- `industry`：历史申万一至三级行业；
-- `stock_st`：历史 ST 名称、类型和 `is_st`；
-- `suspended`：当日停牌标志。
+策略可通过 `result.orders`、`result.transactions`、`result.closed_trades`、`result.records` 和 `result.performance` 继续分析结构化结果。
 
-行业和 ST 字符串在 HDF5 内使用整型字典编码，DataPortal 自动还原。
+## 策略语义
 
-## PIT 指数权重
+### 每日事件顺序
 
-```python
-members = data.index_constituents("000300.SH")
+```text
+D 日应用公司行动
+  → 撮合 D 日之前提交且已到期的订单
+  → 使用 D 日原始收盘价盯市
+  → handle_data 读取截至 D 日的数据
+  → 提交最早 D+1 成交的订单
 ```
 
-返回以 `ts_code` 为索引，包含 `asset / weight / snapshot_date`。可见性严格为：
+`execution_time="open"` 使用 D+1 原始开盘价，`execution_time="close"` 使用 D+1 原始收盘价。无论策略使用 `raw`、`qfq` 还是 `hfq`，成交、现金、费用和涨跌停判断始终使用原始价格。
+
+### 财务 PIT
+
+```text
+coalesce(f_ann_date, ann_date) < 当前回测日
+end_date <= 当前回测日
+```
+
+公告日当天不可见，从公告日后的首个交易日开始可见。同一报告期选择当时可见的最新公告或修订。
+
+### 指数成分 PIT
 
 ```text
 max(snapshot_date) < 当前回测日
 ```
 
-因此 D 日快照从 D+1 可见，首个快照前为空，不使用未来成分回填历史。数据位于 `index_weight.h5`。
+快照日当天不可见。快照之间沿用最近历史权重，不使用未来快照反向填充。
 
-## PIT 财务
+## 本地数据
+
+默认数据根目录为 `~/.tualpha`：
+
+```text
+~/.tualpha/
+├── bundle/
+│   ├── manifest.json
+│   ├── catalog.duckdb
+│   └── parquet/
+│       ├── stock/
+│       ├── etf/
+│       └── index/
+├── reports/quality/<run_id>/
+├── backups/
+├── .locks/
+├── .staging/
+├── .rollback/
+└── update-status.json
+```
+
+日频表使用 `year=YYYY/data.parquet`，财务表使用 `report_year=YYYY/data.parquet`，指数权重使用 `index_code=CODE/year=YYYY/data.parquet`。
+
+### 数据范围
+
+- **A 股**：交易日历、基础信息、日线、复权因子、每日指标、资金流、涨跌停、停复牌、历史 ST、申万行业和四类财务表。
+- **ETF**：基础信息、日线和复权因子。
+- **指数基础信息**：保留完整本地基础表。
+- **指数日线**：仅保存配置的 15 个宽基指数。
+- **指数权重**：默认维护 `000300.SH`、`000852.SH`、`000905.SH`、`000906.SH` 和 `899050.BJ`，可通过 CLI 扩展。
+
+## 全量构建与增量更新
+
+Token 只能通过环境变量或标准输入提供：
+
+```bash
+export TUSHARE_TOKEN="your-token"
+```
+
+### Tushare 全量构建
+
+首次使用或需要完全重建本地数据时，从 Tushare 直接构建完整 Bundle：
+
+```bash
+uv run tualpha build --from 20100101
+```
+
+可限制结束日期或扩展指数权重：
+
+```bash
+uv run tualpha build --from 20100101 --to 20260825
+uv run tualpha build --from 20100101 --index-weight 000016.SH
+uv run tualpha build --from 20100101 --dry-run --json
+```
+
+全量构建与增量更新共用 Tushare 下载、可续传分区缓存、Parquet Writer、Catalog、manifest、校验和原子发布管线。`--from` 必填；长历史构建会产生大量 Tushare 请求，应确认接口权限和配额。
+
+### Tushare 增量更新
+
+```bash
+uv run tualpha update
+```
+
+常用命令：
+
+```bash
+uv run tualpha update --from 20260801 --to 20260825
+uv run tualpha update --repair-from 20260701
+uv run tualpha update --lookback 20
+uv run tualpha update --index-weight 000016.SH
+uv run tualpha update --dry-run --json
+```
+
+财务增量按公告日期回看最近 120 个自然日。更新失败不会修改活动 generation；成功后从最终目录重新打开 Reader 验证。
+
+## DuckDB 本地查询
 
 ```python
-roe = data.fundamental(context.asset, "fina_indicator.roe")
-reports = data.fundamentals(
-    context.asset,
-    ["income.revenue", "balancesheet.total_assets"],
-    periods=4,
-)
+from tualpha import local_data
+
+with local_data() as db:
+    daily = db.query(
+        "stock_daily",
+        fields="ts_code,trade_date,close",
+        filters={"ts_code": "000001.SZ"},
+        start_date="20240101",
+        end_date="20241231",
+    )
+
+    breadth = db.sql(
+        """
+        SELECT trade_date, count(*) AS asset_count
+        FROM stock_daily
+        WHERE trade_date >= ?
+        GROUP BY trade_date
+        ORDER BY trade_date
+        """,
+        ["20240101"],
+    )
 ```
 
-`finance.h5` 保存 `balancesheet / income / cashflow / fina_indicator`。财务记录必须满足：
+SQL 接口只接受只读语句。策略回调不得绕过 DataPortal 直接读取 Parquet 或 Catalog；`local_data()` 面向离线研究、检查和数据维护。
+
+## 数据质量
+
+```bash
+uv run tualpha quality
+uv run tualpha quality --table stock_daily --table income
+uv run tualpha quality --full-hash --json
+```
+
+每次报告包含：
 
 ```text
-effective_ann_date < 当前回测日
-end_date <= 当前回测日
+summary.csv
+findings.csv
+metrics.csv
+report.json
+report.html
 ```
 
-公告日当天不可见。同一报告期选择当时可见的最新公告、`update_flag=1` 优先版本和最大 `source_order`。利润表和现金流量表保持年初至今累计口径。
+列级指标只记录部分缺失，不输出零值或数据源默认未返回的全空列。
 
-## 复权
+## 可视化报告
 
-- 前复权：`raw(D_i) × factor(D_i) / factor(当前回调日)`
-- 后复权：`raw(D_i) × factor(D_i)`
+指定 `output_dir` 后，TuAlpha 自动生成包含以下内容的交互式报告：
 
-公司行动改变持仓数量时，仅同步仍待成交的隔夜全仓卖单；普通买单和部分卖单不会自动改写。
+- 组合与基准累计收益；
+- 回撤和月度收益；
+- 风险收益指标；
+- 费用和拒单原因；
+- 已实现盈亏、盈亏贡献占比和每日权重贡献累计；
+- 每日持仓 CSV。
 
-## 报告
+佣金被视为包含交易所经手费，不单独计算或展示经手费。股票印花税和过户费按日期分段，ETF 不收股票印花税和股票过户费。
 
-指定 `output_dir` 后生成：
+## 文档索引
+
+- 📖 **[架构说明](docs/architecture.md)**：模块职责、事件顺序、查询热路径和原子发布。
+- 💾 **[Bundle 格式](docs/bundle-format.md)**：Parquet 分区、Catalog、manifest、PIT 和完整性协议。
+- 🧠 **[策略 Skill](.agents/skills/tualpha-strategy/SKILL.md)**：策略生成、迁移、审查和验证规范。
+- 📚 **[策略 API](.agents/skills/tualpha-strategy/references/api-reference.md)**：资产、行情、订单、财务和结果 API。
+- ⏱️ **[时序契约](.agents/skills/tualpha-strategy/references/framework-contract.md)**：D/D+1、T+1、费用和未来函数边界。
+- 🧾 **[数据字段](.agents/skills/tualpha-strategy/references/data-fields.md)**：日线、估值、资金流、行业、ST 和财务字段。
+
+## 🧪 测试与质量保证
+
+TuAlpha 使用单元测试和真实 Bundle 验证关键业务规则：
+
+- D 日决策与 D+1 成交；
+- A 股/ETF T+1；
+- 涨跌停、停牌和交易单位；
+- `raw`、`qfq`、`hfq`；
+- 财务和指数成分 PIT；
+- Parquet 增量更新、原子发布和幂等性；
+- DuckDB 查询、质量报告和回测报告。
+
+运行检查：
+
+```bash
+uv sync --dev
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+```
+
+当前基线：
 
 ```text
-outputs/demo/
-├── report.html
-└── daily_positions.csv
+89 passed
 ```
 
-报告包含收益、基准、回撤、费用、交易限制和组合归因，不生成逐笔 Trade Analysis 图。贡献收益按 `Σ(日终权重 × 标的当日收益率)` 逐日累计，现金贡献固定为 0。股票和 ETF 持有天数按正市值日终记录统计；`CASH` 仅统计组合没有正市值证券、全部为现金的交易日。
+## 支持边界
 
-## 实际验证
+- 仅支持日频回测；
+- 仅支持多头现金账户；
+- 股票和 ETF 可交易，指数只能作为基准或 PIT 成分来源；
+- 不支持卖空、融资融券、期货、期权、分钟撮合或 ETF 申赎；
+- 日频成交模型不模拟盘口深度和部分成交队列。
 
-开发机上的真实 schema 7 Bundle：
+## 免责声明
 
-- 7,583 个股票/ETF；
-- 11,648 个指数；
-- 4,040 个交易日；
-- `daily.h5` 50,239,528 行；
-- `finance.h5` 1,752,376 行；
-- `index_weight.h5` 464,246 行；
-- 总大小约 11.56 GiB（包含同文件 packed 加速索引）；
-- 全量 CSV → HDF5 构建约 373 秒。
-
-`D:/projects/quant/strategies/宽基轮动` 在 2017-01-01 至 2026-08-21、每日扫描全市场、最多持有约 400 只股票、完整报告和 CSV 全部启用时，共处理 2,340 个交易日；项目固定的 CPython 3.12 环境端到端耗时约 38.7 秒。该数据仅用于说明实现量级，实际速度取决于硬件和策略。
-
-## 已知边界
-
-- 涨停不买、跌停不卖是保守流动性假设；
-- 日内临时停牌在日频模型中按全天不可交易处理；
-- 不模拟盘口深度、排队、流动性部分成交和冲击成本；目标单仅会因 D+1 实际现金约束按有效交易单位部分成交；
-- Tushare 不提供指数权重历史修订发布时间，无法还原供应商后续修订前版本；
-- 只有复权因子而没有现金分红明细时，公司行动使用分红再投近似。
+本项目仅用于量化研究、软件开发和回测验证，不构成任何投资建议。历史回测结果不代表未来收益。

@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from tualpha import order_target_percent, record, run_algorithm, symbol
+from tualpha import order_target_percent_many, record, run_algorithm, symbol
 
 CANDIDATE_CODES = [
     "000001.SZ",
@@ -74,13 +74,19 @@ def handle_data(context, data):
 
     target_weight = TOTAL_EXPOSURE / len(selected) if selected else 0.0
     selected_set = set(selected)
-    for asset in context.assets:
-        # 无法交易的现有持仓会保留；订单仍可能在 D+1 因市场状态变化被拒绝。
-        if data.can_trade(asset):
-            order_target_percent(
-                asset,
-                target_weight if asset in selected_set else 0.0,
-            )
+    # Mapping 保持插入顺序：先清理非目标持仓，再提交目标权重。
+    exits = {
+        asset: 0.0
+        for asset in context.assets
+        if asset not in selected_set
+        and context.portfolio.amount(asset) > 0
+        and data.can_trade(asset)
+    }
+    targets = {asset: target_weight for asset in selected if data.can_trade(asset)}
+    if exits:
+        order_target_percent_many(exits)
+    if targets:
+        order_target_percent_many(targets)
 
     context.last_rebalance_month = month
     record(

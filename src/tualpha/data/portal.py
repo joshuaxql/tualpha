@@ -1,38 +1,30 @@
-"""Schema-7 HDF5 point-in-time data portal."""
+"""DuckDB/Parquet point-in-time data portal."""
 
 from __future__ import annotations
 
-import json
 import os
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Self
 
-import h5py
 import numpy as np
 import pandas as pd
 
-from ._hdf5_store import (
-    HDF5_FILES,
-    PACKED_LAYOUT,
-    date_to_int,
-    dates_to_int,
-    load_assets_manifest,
-    open_h5_checked,
-)
-from .assets import Asset, AssetFinder
-from .bundle import (
+from ..config import AdjustmentMode, normalize_session
+from ..exceptions import DataError
+from ..model.asset import Asset, AssetFinder
+from .bundle.manager import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,
     latest_bundle_path,
     release_bundle_read_lock,
 )
-from .calendar import ChinaTradingCalendar
-from .config import AdjustmentMode, normalize_session
-from .exceptions import DataError
+from .bundle.parquet_schema import FINANCE_SPECS
+from .bundle.parquet_store import load_manifest
+from .query import LocalDataClient
+from .trading_calendar import ChinaTradingCalendar
 
 _ADJUSTED_PRICE_FIELDS = frozenset({"open", "high", "low", "close", "price"})
 _BASE_FIELDS = frozenset(
@@ -54,34 +46,9 @@ _BASE_FIELDS = frozenset(
 _EXTENDED_DAILY_NAMESPACES = frozenset(
     {"daily_basic", "moneyflow", "industry", "stock_st"}
 )
-_FINANCIAL_NAMESPACES = frozenset(
-    {"balancesheet", "income", "cashflow", "fina_indicator"}
-)
+_FINANCIAL_NAMESPACES = frozenset(FINANCE_SPECS)
 _DEFAULT_COLUMN_CACHE_MIB = 2048
-_QUERY_PLAN_CACHE_SIZE = 128
 _INDEX_FRAME_CACHE_SIZE = 128
-
-
-def _default_column_cache_bytes() -> int:
-    raw = os.environ.get("TUALPHA_COLUMN_CACHE_MIB", str(_DEFAULT_COLUMN_CACHE_MIB))
-    try:
-        mib = int(raw)
-    except ValueError as exc:
-        raise DataError("TUALPHA_COLUMN_CACHE_MIB must be an integer") from exc
-    if mib < 0:
-        raise DataError("TUALPHA_COLUMN_CACHE_MIB must not be negative")
-    return mib * 1024**2
-
-
-@dataclass(slots=True)
-class _AssetQueryPlan:
-    sids: np.ndarray
-    first: np.ndarray
-    last: np.ndarray
-    offsets: np.ndarray
-    list_dates: np.ndarray
-    delist_dates: np.ndarray
-
 
 _BASE_STORAGE = {
     "open": ("daily", "open"),
@@ -98,6 +65,89 @@ _BASE_STORAGE = {
     "suspended": ("suspend_d", "suspended"),
 }
 
+_DAILY_TABLES = {
+    "daily": ("stock_daily", "etf_daily"),
+    "adj_factor": ("adj_factor", "etf_adj_factor"),
+    "daily_basic": ("daily_basic",),
+    "moneyflow": ("moneyflow",),
+    "stk_limit": ("stk_limit",),
+    "suspend_d": ("suspend_d",),
+    "stock_st": ("stock_st",),
+    "industry": ("industry",),
+}
+
+_DAILY_FIELDS: dict[str, dict[str, Any]] = {
+    **{
+        f"daily_basic.{name}": {
+            "role": "daily_basic",
+            "column": name,
+            "kind": "numeric",
+        }
+        for name in [
+            "close",
+            "turnover_rate",
+            "turnover_rate_f",
+            "volume_ratio",
+            "pe",
+            "pe_ttm",
+            "pb",
+            "ps",
+            "ps_ttm",
+            "dv_ratio",
+            "dv_ttm",
+            "total_share",
+            "float_share",
+            "free_share",
+            "total_mv",
+            "circ_mv",
+            "limit_status",
+        ]
+    },
+    **{
+        f"moneyflow.{name}": {"role": "moneyflow", "column": name, "kind": "numeric"}
+        for name in [
+            "buy_sm_vol",
+            "buy_sm_amount",
+            "sell_sm_vol",
+            "sell_sm_amount",
+            "buy_md_vol",
+            "buy_md_amount",
+            "sell_md_vol",
+            "sell_md_amount",
+            "buy_lg_vol",
+            "buy_lg_amount",
+            "sell_lg_vol",
+            "sell_lg_amount",
+            "buy_elg_vol",
+            "buy_elg_amount",
+            "sell_elg_vol",
+            "sell_elg_amount",
+            "net_mf_vol",
+            "net_mf_amount",
+        ]
+    },
+    **{
+        f"industry.{name}": {"role": "industry", "column": name, "kind": "categorical"}
+        for name in ["l1_code", "l1_name", "l2_code", "l2_name", "l3_code", "l3_name"]
+    },
+    **{
+        f"stock_st.{name}": {"role": "stock_st", "column": name, "kind": "categorical"}
+        for name in ["name", "type", "type_name"]
+    },
+    "stock_st.is_st": {"role": "stock_st", "column": "is_st", "kind": "flag"},
+}
+
+
+def _default_column_cache_bytes() -> int:
+    raw = os.environ.get("TUALPHA_COLUMN_CACHE_MIB", str(_DEFAULT_COLUMN_CACHE_MIB))
+    try:
+        mib = int(raw)
+    except ValueError as exc:
+        raise DataError("TUALPHA_COLUMN_CACHE_MIB must be an integer") from exc
+    if mib < 0:
+        raise DataError("TUALPHA_COLUMN_CACHE_MIB must not be negative")
+    return mib * 1024**2
+
 
 def _as_float(value: object, default: float = np.nan) -> float:
     try:
@@ -107,23 +157,8 @@ def _as_float(value: object, default: float = np.nan) -> float:
     return result if np.isfinite(result) else default
 
 
-def _field_array(dataset: h5py.Dataset, field: str) -> np.ndarray:
-    values = np.asarray(dataset.fields(field)[:])
-    if values.dtype.names:
-        values = np.asarray(values[field])
-    return values
-
-
-def _decode_bytes(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.rstrip(b"\0").decode("utf-8")
-    if isinstance(value, np.bytes_):
-        return bytes(value).rstrip(b"\0").decode("utf-8")
-    return str(value)
-
-
 class BundleDataPortal:
-    """Read bars and point-in-time datasets from an immutable HDF5 Bundle."""
+    """Read daily bars and PIT datasets from year-partitioned Parquet."""
 
     def __init__(
         self,
@@ -136,7 +171,7 @@ class BundleDataPortal:
         *,
         column_cache_max_bytes: int | None = None,
     ) -> None:
-        from .data import DailyBar
+        from .bar import DailyBar
 
         self._daily_bar_type = DailyBar
         self.bundle_root = Path(bundle_root).expanduser()
@@ -151,138 +186,153 @@ class BundleDataPortal:
         )
         if self._column_cache_max_bytes < 0:
             raise ValueError("column_cache_max_bytes must not be negative")
-        self._bundle_lock_key, self._bundle_lock = acquire_bundle_read_lock(
+        self._bundle_lock_key, _ = acquire_bundle_read_lock(
             self.bundle_root, bundle_name
         )
-        self._h5: dict[str, h5py.File] = {}
-        self._finance = None
-        self._daily_reader = None
-        self._daily_table = None
-        self._index_table = None
-        self._index_constituents = None
+        self._client: LocalDataClient | None = None
         try:
             self.bundle_path = latest_bundle_path(self.bundle_root, bundle_name)
-            self._manifest = load_assets_manifest(self.bundle_path / "assets.pk")
+            self._manifest = load_manifest(self.bundle_path)
             generation = str(self._manifest["generation"])
             if (
                 asset_finder.bundle_generation != generation
                 or calendar.bundle_generation != generation
             ):
                 raise DataError(
-                    "bundle components come from different generations; "
-                    "recreate AssetFinder and ChinaTradingCalendar"
+                    "bundle components come from different generations; recreate AssetFinder and ChinaTradingCalendar"
                 )
-            self._h5 = {
-                role: open_h5_checked(
-                    self.bundle_path / filename,
-                    expected_role=role,
-                    expected_generation=generation,
-                )
-                for filename, role in HDF5_FILES.items()
+            self._client = LocalDataClient(self.bundle_root, bundle_name)
+            self._assets_by_sid = {asset.sid: asset for asset in asset_finder}
+            self._ordered_assets = tuple(
+                sorted(asset_finder, key=lambda item: item.sid)
+            )
+            self._asset_position = {
+                asset.sid: index for index, asset in enumerate(self._ordered_assets)
             }
-            self._assets_by_sid = {
-                asset.sid: asset
-                for asset in sorted(asset_finder, key=lambda item: item.sid)
+            self._code_position = {
+                asset.ts_code: index for index, asset in enumerate(self._ordered_assets)
             }
-            self._ordered_assets = tuple(self._assets_by_sid.values())
-            self._initialize_row_metadata()
+            self._sessions = calendar.sessions[calendar.sessions <= self.backtest_end]
+            if self._sessions.empty:
+                raise DataError("bundle has no sessions on or before the backtest end")
+            self._session_values = self._sessions.asi8
+            self._session_date_ints = np.asarray(
+                self._sessions.year * 10_000
+                + self._sessions.month * 100
+                + self._sessions.day,
+                dtype=np.int32,
+            )
+            self._list_dates = np.asarray(
+                [
+                    asset.list_date.value
+                    if asset.list_date is not None
+                    else np.iinfo(np.int64).min
+                    for asset in self._ordered_assets
+                ],
+                dtype=np.int64,
+            )
+            self._delist_dates = np.asarray(
+                [
+                    asset.delist_date.value
+                    if asset.delist_date is not None
+                    else np.iinfo(np.int64).max
+                    for asset in self._ordered_assets
+                ],
+                dtype=np.int64,
+            )
             self._column_cache: OrderedDict[str, np.ndarray] = OrderedDict()
             self._column_cache_bytes = 0
-            self._query_plans: OrderedDict[tuple[int, ...], _AssetQueryPlan] = (
+            self._loaded_positions: dict[str, np.ndarray] = {}
+            self._categories: dict[str, tuple[str, ...]] = {}
+            self._finance_cache: dict[tuple[int, str], pd.DataFrame] = {}
+            self._index_arrays: dict[str, pd.DataFrame] = {}
+            self._index_frames: OrderedDict[tuple[str, str], pd.DataFrame] = (
                 OrderedDict()
             )
-            self._index_arrays: dict[str, np.ndarray] = {}
-            self._index_frames: OrderedDict[tuple[str, int], pd.DataFrame] = (
-                OrderedDict()
+            asset_positions = pd.DataFrame(
+                {
+                    "ts_code": tuple(self._code_position),
+                    "asset_position": tuple(self._code_position.values()),
+                }
             )
+            session_positions = pd.DataFrame(
+                {
+                    "trade_date": self._sessions.strftime("%Y%m%d"),
+                    "session_position": np.arange(len(self._sessions), dtype=np.int32),
+                }
+            )
+            self._client.connection.register(
+                "_tualpha_asset_position_frame", asset_positions
+            )
+            self._client.connection.register(
+                "_tualpha_session_position_frame", session_positions
+            )
+            try:
+                self._client.connection.execute(
+                    "CREATE TEMP TABLE _tualpha_asset_positions AS "
+                    "SELECT * FROM _tualpha_asset_position_frame"
+                )
+                self._client.connection.execute(
+                    "CREATE TEMP TABLE _tualpha_session_positions AS "
+                    "SELECT * FROM _tualpha_session_position_frame"
+                )
+            finally:
+                self._client.connection.unregister("_tualpha_asset_position_frame")
+                self._client.connection.unregister("_tualpha_session_position_frame")
             self._bar_presence: np.ndarray | None = None
-            self._daily_fields = self._load_daily_fields()
-            self._financial_fields = self._load_financial_fields()
+            self._financial_fields = {
+                f"{table}.{column}": (table, column)
+                for table, spec in FINANCE_SPECS.items()
+                for column in spec.column_names
+                if column
+                not in {
+                    "ts_code",
+                    "ann_date",
+                    "f_ann_date",
+                    "effective_ann_date",
+                    "end_date",
+                    "report_type",
+                    "comp_type",
+                    "end_type",
+                    "update_flag",
+                    "source_order",
+                }
+            }
             self._index_constituent_codes = tuple(
-                str(code).upper() for code in self._manifest.get("index_codes", [])
+                sorted(
+                    str(value[0]).upper()
+                    for value in self._client.connection.execute(
+                        "SELECT DISTINCT index_code FROM index_weight"
+                    ).fetchall()
+                )
             )
         except Exception:
-            for handle in self._h5.values():
-                handle.close()
-            self._h5 = {}
+            if self._client is not None:
+                self._client.close()
             release_bundle_read_lock(self._bundle_lock_key)
             self._bundle_lock_key = None
             raise
 
-    def _initialize_row_metadata(self) -> None:
-        max_sid = max(self._assets_by_sid, default=-1)
-        size = max_sid + 1
-        self._first_row_by_sid = np.full(size, -1, dtype=np.int64)
-        self._last_row_by_sid = np.full(size, -1, dtype=np.int64)
-        self._calendar_offset_by_sid = np.full(size, -1, dtype=np.int64)
-        self._list_date_by_sid = np.full(size, np.iinfo(np.int64).min, dtype=np.int64)
-        self._delist_date_by_sid = np.full(size, np.iinfo(np.int64).max, dtype=np.int64)
-        self._packed_slices: dict[int, slice] = {}
-        position = 0
-        daily = self._h5["daily"]["data"]
-        sessions = self.calendar.sessions
-        for asset in self._ordered_assets:
-            dataset = daily.get(asset.ts_code)
-            if dataset is None or asset.list_date is None or asset.delist_date is None:
-                continue
-            offset = int(sessions.searchsorted(asset.list_date, side="left"))
-            stop = int(sessions.searchsorted(asset.delist_date, side="right"))
-            length = max(0, stop - offset)
-            if not length:
-                continue
-            if len(dataset) != length:
-                raise DataError(
-                    f"daily.h5 rows do not match assets.pk for {asset.ts_code}"
-                )
-            first = position
-            last = position + length - 1
-            self._first_row_by_sid[asset.sid] = first
-            self._last_row_by_sid[asset.sid] = last
-            self._calendar_offset_by_sid[asset.sid] = offset
-            self._packed_slices[asset.sid] = slice(first, last + 1)
-            position = last + 1
-            if asset.list_date is not None:
-                self._list_date_by_sid[asset.sid] = asset.list_date.value
-            if asset.delist_date is not None:
-                self._delist_date_by_sid[asset.sid] = asset.delist_date.value
-        self._packed_row_count = position
+    @property
+    def _connection(self):
+        if self._client is None:
+            raise DataError("data portal is closed")
+        return self._client.connection
 
-    def _load_daily_fields(self) -> dict[str, dict[str, Any]]:
-        fields: dict[str, dict[str, Any]] = {}
-        for namespace in _EXTENDED_DAILY_NAMESPACES:
-            raw = self._h5[namespace].attrs.get("fields", "{}")
-            try:
-                specs = json.loads(str(raw))
-            except ValueError as exc:
-                raise DataError(f"invalid field registry in {namespace}.h5") from exc
-            for column, spec in specs.items():
-                categories: list[str] = []
-                if spec["kind"] == "categorical":
-                    dictionary = self._h5[namespace].get("dictionary")
-                    if dictionary is None or column not in dictionary:
-                        raise DataError(
-                            f"categorical dictionary is missing: {namespace}.{column}"
-                        )
-                    categories = [str(value) for value in dictionary[column].asstr()[:]]
-                fields[f"{namespace}.{column}"] = {
-                    "role": namespace,
-                    "column": str(column),
-                    "kind": str(spec["kind"]),
-                    "categories": categories,
-                }
-        return fields
+    def close(self) -> None:
+        self.clear_cache()
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        if getattr(self, "_bundle_lock_key", None) is not None:
+            release_bundle_read_lock(self._bundle_lock_key)
+            self._bundle_lock_key = None
 
-    def _load_financial_fields(self) -> dict[str, tuple[str, str]]:
-        raw = self._h5["finance"].attrs.get("fields", "{}")
-        try:
-            registry = json.loads(str(raw))
-        except ValueError as exc:
-            raise DataError("invalid field registry in finance.h5") from exc
-        fields: dict[str, tuple[str, str]] = {}
-        for table, columns in registry.items():
-            for column in columns:
-                fields[f"{table}.{column}"] = (str(table), str(column))
-        return fields
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
 
     def _extended_daily_spec(self, field: str) -> dict[str, Any] | None:
         if "." not in field:
@@ -294,220 +344,66 @@ class BundleDataPortal:
             )
         if namespace not in _EXTENDED_DAILY_NAMESPACES:
             raise KeyError(f"unknown data namespace: {namespace!r}")
-        spec = self._daily_fields.get(field)
-        if spec is None:
-            raise KeyError(f"unknown daily field: {field!r}")
-        return spec
+        try:
+            return _DAILY_FIELDS[field]
+        except KeyError as exc:
+            raise KeyError(f"unknown daily field: {field!r}") from exc
 
     def _financial_spec(self, field: str) -> tuple[str, str]:
         try:
             return self._financial_fields[field]
         except KeyError as exc:
-            if "." not in field:
-                raise KeyError(
-                    f"financial field must use '<dataset>.<column>': {field!r}"
-                ) from exc
             raise KeyError(f"unknown financial value field: {field!r}") from exc
 
     def available_fields(self, namespace: str | None = None) -> tuple[str, ...]:
-        namespaces = (
-            sorted(_EXTENDED_DAILY_NAMESPACES | _FINANCIAL_NAMESPACES)
-            if namespace is None
-            else [namespace]
-        )
-        fields: list[str] = []
-        for name in namespaces:
-            if name in _EXTENDED_DAILY_NAMESPACES:
-                fields.extend(
+        if namespace is None:
+            return tuple(sorted((*_DAILY_FIELDS, *self._financial_fields)))
+        if namespace in _EXTENDED_DAILY_NAMESPACES:
+            return tuple(
+                sorted(
                     field
-                    for field in self._daily_fields
-                    if field.startswith(f"{name}.")
+                    for field in _DAILY_FIELDS
+                    if field.startswith(f"{namespace}.")
                 )
-            elif name in _FINANCIAL_NAMESPACES:
-                fields.extend(
+            )
+        if namespace in _FINANCIAL_NAMESPACES:
+            return tuple(
+                sorted(
                     field
                     for field in self._financial_fields
-                    if field.startswith(f"{name}.")
+                    if field.startswith(f"{namespace}.")
                 )
-            else:
-                raise KeyError(f"unknown data namespace: {name!r}")
-        return tuple(sorted(fields))
-
-    def close(self) -> None:
-        self.clear_cache()
-        for handle in self._h5.values():
-            handle.close()
-        self._h5 = {}
-        if getattr(self, "_bundle_lock_key", None) is not None:
-            release_bundle_read_lock(self._bundle_lock_key)
-            self._bundle_lock_key = None
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.close()
+            )
+        raise KeyError(f"unknown data namespace: {namespace!r}")
 
     @lru_cache(maxsize=8_192)  # noqa: B019
-    def _session_location(self, date_value: int) -> int | None:
-        date = pd.to_datetime(str(date_value), format="%Y%m%d")
-        try:
-            return int(self.calendar.sessions.get_loc(date))
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    @lru_cache(maxsize=131_072)  # noqa: B019
-    def _row_index(self, sid: int, date_value: int) -> int | None:
-        day_location = self._session_location(date_value)
-        if day_location is None or sid < 0 or sid >= len(self._first_row_by_sid):
-            return None
-        first = int(self._first_row_by_sid[sid])
-        offset = int(self._calendar_offset_by_sid[sid])
-        if first < 0 or offset < 0:
-            return None
-        row = first + day_location - offset
-        if row < first or row > int(self._last_row_by_sid[sid]):
-            return None
-        return row
-
-    def _query_plan(self, assets: Sequence[Asset]) -> _AssetQueryPlan:
-        key = tuple(asset.sid for asset in assets)
-        cached = self._query_plans.get(key)
-        if cached is not None:
-            self._query_plans.move_to_end(key)
-            return cached
-
-        sids = np.asarray(key, dtype=np.int64)
-        known = (sids >= 0) & (sids < len(self._first_row_by_sid))
-        first = np.full(len(sids), -1, dtype=np.int64)
-        last = np.full(len(sids), -1, dtype=np.int64)
-        offsets = np.full(len(sids), -1, dtype=np.int64)
-        list_dates = np.full(len(sids), np.iinfo(np.int64).min, dtype=np.int64)
-        delist_dates = np.full(len(sids), np.iinfo(np.int64).max, dtype=np.int64)
-        first[known] = self._first_row_by_sid[sids[known]]
-        last[known] = self._last_row_by_sid[sids[known]]
-        offsets[known] = self._calendar_offset_by_sid[sids[known]]
-        list_dates[known] = self._list_date_by_sid[sids[known]]
-        delist_dates[known] = self._delist_date_by_sid[sids[known]]
-        for values in (sids, first, last, offsets, list_dates, delist_dates):
-            values.setflags(write=False)
-        plan = _AssetQueryPlan(
-            sids=sids,
-            first=first,
-            last=last,
-            offsets=offsets,
-            list_dates=list_dates,
-            delist_dates=delist_dates,
+    def _session_location(self, value: int) -> int | None:
+        date = pd.to_datetime(str(value), format="%Y%m%d")
+        position = int(self._sessions.searchsorted(date))
+        return (
+            position
+            if position < len(self._sessions) and self._sessions[position] == date
+            else None
         )
-        self._query_plans[key] = plan
-        self._query_plans.move_to_end(key)
-        while len(self._query_plans) > _QUERY_PLAN_CACHE_SIZE:
-            self._query_plans.popitem(last=False)
-        return plan
 
-    def _row_indices(
-        self,
-        assets: Sequence[Asset],
-        session: str | pd.Timestamp,
-    ) -> tuple[pd.Timestamp, np.ndarray, np.ndarray, np.ndarray]:
-        date = normalize_session(session)
-        plan = self._query_plan(assets)
-        if not len(plan.sids):
-            rows = np.empty(0, dtype=np.int64)
-            empty = np.zeros(0, dtype=bool)
-            return date, rows, empty, empty
-        alive = (plan.list_dates <= date.value) & (date.value <= plan.delist_dates)
-        day_location = self._session_location(date_to_int(date))
-        if day_location is None:
-            rows = np.full(len(plan.sids), -1, dtype=np.int64)
-            return date, rows, np.zeros(len(plan.sids), dtype=bool), alive
-        rows = plan.first + day_location - plan.offsets
-        valid = (
-            alive
-            & (plan.first >= 0)
-            & (plan.offsets >= 0)
-            & (rows >= plan.first)
-            & (rows <= plan.last)
+    def _asset_positions(self, assets: Sequence[Asset]) -> np.ndarray:
+        return np.asarray(
+            [self._asset_position.get(asset.sid, -1) for asset in assets],
+            dtype=np.int64,
         )
-        rows = np.asarray(rows, dtype=np.int64)
-        rows[~valid] = -1
-        return date, rows, valid, alive
 
-    def _row_matrix(
-        self,
-        assets: Sequence[Asset],
-        sessions: pd.DatetimeIndex,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        plan = self._query_plan(assets)
-        shape = (len(sessions), len(plan.sids))
-        if not shape[0] or not shape[1]:
-            return (
-                np.full(shape, -1, dtype=np.int64),
-                np.zeros(shape, dtype=bool),
-                np.zeros(shape, dtype=bool),
-            )
-        locations = self.calendar.sessions.get_indexer(sessions).astype(np.int64)
-        session_values = sessions.asi8[:, None]
-        alive = (plan.list_dates[None, :] <= session_values) & (
-            session_values <= plan.delist_dates[None, :]
-        )
-        rows = plan.first[None, :] + locations[:, None] - plan.offsets[None, :]
-        valid = (
-            alive
-            & (locations[:, None] >= 0)
-            & (plan.first[None, :] >= 0)
-            & (plan.offsets[None, :] >= 0)
-            & (rows >= plan.first[None, :])
-            & (rows <= plan.last[None, :])
-        )
-        rows = np.asarray(rows, dtype=np.int64)
-        rows[~valid] = -1
-        return rows, valid, alive
+    def _alive(self, positions: np.ndarray, sessions: pd.DatetimeIndex) -> np.ndarray:
+        valid_positions = positions >= 0
+        result = np.zeros((len(sessions), len(positions)), dtype=bool)
+        if valid_positions.any():
+            values = sessions.asi8[:, None]
+            selected = positions[valid_positions]
+            result[:, valid_positions] = (
+                self._list_dates[selected][None, :] <= values
+            ) & (values <= self._delist_dates[selected][None, :])
+        return result
 
-    def _full_column(self, role: str, field: str) -> np.ndarray:
-        key = f"{role}.{field}"
-        cached = self._column_cache.get(key)
-        if cached is not None:
-            self._column_cache.move_to_end(key)
-            return cached
-        handle = self._h5[role]
-        packed = handle.get("packed")
-        if isinstance(packed, h5py.Group) and field in packed:
-            if str(packed.attrs.get("layout", "")) != PACKED_LAYOUT:
-                raise DataError(f"packed layout is invalid in {role}.h5")
-            dataset = packed[field]
-            if len(dataset) != self._packed_row_count:
-                raise DataError(f"packed rows do not align in {role}.h5: {field}")
-            values = np.asarray(dataset[:])
-        else:
-            group = handle["data"]
-            dtype: np.dtype[Any] | None = None
-            for asset in self._ordered_assets:
-                if asset.ts_code in group:
-                    dtype = group[asset.ts_code].dtype[field]
-                    break
-            if dtype is None:
-                return np.array([], dtype=float)
-            values = np.empty(self._packed_row_count, dtype=dtype)
-            if dtype.kind == "f":
-                values.fill(np.nan)
-            elif dtype.kind == "i":
-                values.fill(-1)
-            else:
-                values.fill(0)
-            for asset in self._ordered_assets:
-                target = self._packed_slices.get(asset.sid)
-                if target is None:
-                    continue
-                dataset = group.get(asset.ts_code)
-                if dataset is None or field not in (dataset.dtype.names or ()):
-                    continue
-                source = _field_array(dataset, field)
-                if len(source) != target.stop - target.start:
-                    raise DataError(
-                        f"{role}.h5 rows do not align with daily.h5 for {asset.ts_code}"
-                    )
-                values[target] = source
+    def _cache(self, key: str, values: np.ndarray) -> np.ndarray:
         values.setflags(write=False)
         if values.nbytes <= self._column_cache_max_bytes:
             while (
@@ -515,55 +411,148 @@ class BundleDataPortal:
                 and self._column_cache_bytes + values.nbytes
                 > self._column_cache_max_bytes
             ):
-                _, evicted = self._column_cache.popitem(last=False)
+                evicted_key, evicted = self._column_cache.popitem(last=False)
                 self._column_cache_bytes -= evicted.nbytes
+                self._loaded_positions.pop(evicted_key, None)
             self._column_cache[key] = values
             self._column_cache_bytes += values.nbytes
         return values
 
-    def _column_values(self, role: str, field: str, rows: np.ndarray) -> np.ndarray:
-        if not len(rows):
-            return np.array([], dtype=float)
-        return np.asarray(self._full_column(role, field)[rows])
+    def _field_query(self, role: str, field: str) -> tuple[str, list[object]]:
+        tables = _DAILY_TABLES[role]
+        if role == "suspend_d" and field == "suspended":
+            selects = [
+                "SELECT trade_date, ts_code, 1::DOUBLE AS value FROM suspend_d WHERE upper(coalesce(suspend_type, '')) = 'S'"
+            ]
+        elif role == "stock_st" and field == "is_st":
+            selects = ["SELECT trade_date, ts_code, 1::DOUBLE AS value FROM stock_st"]
+        else:
+            selects = [
+                f'SELECT trade_date, ts_code, "{field}" AS value FROM "{table}"'
+                for table in tables
+            ]
+        return " UNION ALL ".join(selects), []
+
+    def _full_column(
+        self,
+        role: str,
+        field: str,
+        positions: np.ndarray | None = None,
+    ) -> np.ndarray:
+        key = f"{role}.{field}"
+        cached = self._column_cache.get(key)
+        categorical = role in {"industry", "stock_st"} and field != "is_st"
+        if cached is None:
+            if categorical:
+                cached = np.full(
+                    (len(self._sessions), len(self._ordered_assets)),
+                    -1,
+                    dtype=np.int32,
+                )
+            else:
+                flag = (role, field) in {
+                    ("stock_st", "is_st"),
+                    ("suspend_d", "suspended"),
+                }
+                cached = np.full(
+                    (len(self._sessions), len(self._ordered_assets)),
+                    0 if flag else np.nan,
+                    dtype=np.uint8 if flag else np.float32,
+                )
+            self._loaded_positions[key] = np.zeros(
+                len(self._ordered_assets), dtype=bool
+            )
+            cached = self._cache(key, cached)
+        else:
+            self._column_cache.move_to_end(key)
+
+        loaded = self._loaded_positions.setdefault(
+            key, np.zeros(len(self._ordered_assets), dtype=bool)
+        )
+        raw_requested = (
+            np.arange(len(self._ordered_assets), dtype=np.int64)
+            if positions is None
+            else np.asarray(positions, dtype=np.int64)
+        )
+        in_range = (raw_requested >= 0) & (raw_requested < len(self._ordered_assets))
+        if bool(in_range.all()) and bool(loaded[raw_requested].all()):
+            return cached
+        requested = np.unique(raw_requested[in_range])
+        missing = requested[~loaded[requested]]
+        if not len(missing):
+            return cached
+
+        query, params = self._field_query(role, field)
+        placeholders = ", ".join("?" for _ in missing)
+        query = (
+            "SELECT sessions.session_position, assets.asset_position, "
+            "source_rows.value FROM ("
+            f"{query}) source_rows "
+            "JOIN _tualpha_asset_positions assets "
+            "ON upper(source_rows.ts_code) = assets.ts_code "
+            "JOIN _tualpha_session_positions sessions "
+            "ON source_rows.trade_date = sessions.trade_date "
+            f"WHERE assets.asset_position IN ({placeholders})"
+        )
+        reader = self._connection.execute(
+            query, [*params, *[int(value) for value in missing]]
+        ).fetch_record_batch(rows_per_batch=500_000)
+        cached.setflags(write=True)
+        for batch in reader:
+            frame = batch.to_pandas()
+            date_positions = frame["session_position"].to_numpy(dtype=np.int64)
+            asset_positions = frame["asset_position"].to_numpy(dtype=np.int64)
+            valid = (date_positions >= 0) & (asset_positions >= 0)
+            if categorical:
+                text = frame["value"].fillna("").astype(str)
+                categories = list(self._categories.get(key, ()))
+                known = set(categories)
+                categories.extend(
+                    value for value in text.unique() if value and value not in known
+                )
+                self._categories[key] = tuple(categories)
+                mapping = {value: index for index, value in enumerate(categories)}
+                encoded = np.asarray(
+                    [mapping.get(value, -1) for value in text], dtype=np.int32
+                )
+                cached[date_positions[valid], asset_positions[valid]] = encoded[valid]
+            else:
+                decoded = pd.to_numeric(frame["value"], errors="coerce").to_numpy(
+                    dtype=float
+                )
+                cached[date_positions[valid], asset_positions[valid]] = decoded[valid]
+        loaded[missing] = True
+        cached.setflags(write=False)
+        return cached
 
     def _bar_presence_array(self) -> np.ndarray:
         if self._bar_presence is None:
-            close = np.asarray(self._full_column("daily", "close"), dtype=float)
-            suspended = np.asarray(
-                self._full_column("suspend_d", "suspended"), dtype=bool
-            )
-            present = np.isfinite(close) | suspended
+            present = np.isfinite(
+                self._full_column("daily", "close")
+            ) | self._full_column("suspend_d", "suspended").astype(bool)
             present.setflags(write=False)
             self._bar_presence = present
         return self._bar_presence
 
-    def _scalar(
-        self, asset: Asset, session: pd.Timestamp, role: str, field: str
-    ) -> object:
-        row = self._row_index(asset.sid, date_to_int(session))
-        if row is None:
-            return np.nan
-        return self._full_column(role, field)[row]
-
     @lru_cache(maxsize=16_384)  # noqa: B019
     def _factor_series(self, sid: int) -> tuple[np.ndarray, np.ndarray]:
-        asset = self._assets_by_sid.get(sid)
-        if asset is None:
+        position = self._asset_position.get(sid)
+        if position is None:
             return np.array([], dtype=np.int32), np.array([], dtype=float)
-        dataset = self._h5["adj_factor"]["data"].get(asset.ts_code)
-        if dataset is None:
-            return np.array([], dtype=np.int32), np.array([], dtype=float)
-        dates = _field_array(dataset, "trade_date").astype(np.int32, copy=False)
-        factors = _field_array(dataset, "adj_factor").astype(float, copy=False)
-        valid = np.isfinite(factors) & (factors > 0)
-        return dates[valid], factors[valid]
+        values = self._full_column(
+            "adj_factor", "adj_factor", np.asarray([position], dtype=np.int64)
+        )[:, position]
+        valid = np.isfinite(values) & (values > 0)
+        return self._session_date_ints[valid], values[valid]
 
     @lru_cache(maxsize=131_072)  # noqa: B019
     def factor(self, asset: Asset, session: pd.Timestamp) -> float:
         dates, factors = self._factor_series(asset.sid)
         if not len(dates):
             return 1.0
-        index = int(np.searchsorted(dates, date_to_int(session), side="right") - 1)
+        date = normalize_session(session)
+        value = date.year * 10_000 + date.month * 100 + date.day
+        index = int(np.searchsorted(dates, value, side="right") - 1)
         return float(factors[index]) if index >= 0 else 1.0
 
     def adjustment_multiplier(
@@ -589,128 +578,81 @@ class BundleDataPortal:
         reference = self.factor(asset, reference_date)
         return factor / reference if reference else 1.0
 
-    @lru_cache(maxsize=131_072)  # noqa: B019
-    def raw_bar(self, asset: Asset, session: str | pd.Timestamp):
-        date = normalize_session(session)
-        if not asset.is_alive_on(date):
-            return None
-        row = self._row_index(asset.sid, date_to_int(date))
-        if row is None:
-            return None
-        values = {
-            field: _as_float(self._full_column("daily", field)[row])
-            for field in (
-                "open",
-                "high",
-                "low",
-                "close",
-                "pre_close",
-                "volume",
-                "turnover",
-            )
-        }
-        up = _as_float(self._full_column("stk_limit", "up_limit")[row])
-        down = _as_float(self._full_column("stk_limit", "down_limit")[row])
-        suspended = bool(self._full_column("suspend_d", "suspended")[row])
-        if (
-            not any(
-                np.isfinite(values[field]) for field in ("open", "high", "low", "close")
-            )
-            and not suspended
-        ):
-            return None
-        return self._daily_bar_type(
-            asset=asset,
-            session=date,
-            open=values["open"],
-            high=values["high"],
-            low=values["low"],
-            close=values["close"],
-            pre_close=values["pre_close"],
-            volume=max(0.0, _as_float(values["volume"], 0.0)),
-            turnover=max(0.0, _as_float(values["turnover"], 0.0)),
-            up_limit=up,
-            down_limit=down,
-            suspended=suspended,
-        )
+    def _matrix_locations(
+        self, assets: Sequence[Asset], sessions: pd.DatetimeIndex
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        asset_positions = self._asset_positions(assets)
+        session_positions = self._sessions.get_indexer(sessions)
+        valid_sessions = session_positions >= 0
+        alive = self._alive(asset_positions, sessions)
+        valid = alive & valid_sessions[:, None] & (asset_positions[None, :] >= 0)
+        return session_positions, asset_positions, valid
 
-    def execution_bars(
+    def _adjustment_matrix(
         self,
         assets: Sequence[Asset],
-        session: str | pd.Timestamp,
-        execution_field: str,
-    ) -> dict[Asset, Any]:
-        if execution_field not in {"open", "close"}:
-            raise ValueError("execution_field must be open or close")
-        asset_list = list(assets)
-        date, rows, valid, _ = self._row_indices(asset_list, session)
-        positions = np.flatnonzero(valid)
-        if positions.size:
-            present = self._bar_presence_array()[rows[positions]]
-            valid[positions[~present]] = False
-        positions = np.flatnonzero(valid)
-        result = {asset: None for asset in asset_list}
-        if not positions.size:
-            return result
-        selected = rows[positions]
-        prices = self._column_values("daily", execution_field, selected).astype(float)
-        volumes = np.maximum(
-            self._column_values("daily", "volume", selected).astype(float), 0.0
-        )
-        up = self._column_values("stk_limit", "up_limit", selected).astype(float)
-        down = self._column_values("stk_limit", "down_limit", selected).astype(float)
-        suspended = self._column_values("suspend_d", "suspended", selected).astype(bool)
-        for offset, asset_position in enumerate(positions):
-            price = float(prices[offset])
-            result[asset_list[asset_position]] = self._daily_bar_type(
-                asset=asset_list[asset_position],
-                session=date,
-                open=price if execution_field == "open" else np.nan,
-                high=np.nan,
-                low=np.nan,
-                close=price if execution_field == "close" else np.nan,
-                pre_close=np.nan,
-                volume=float(volumes[offset]),
-                turnover=0.0,
-                up_limit=_as_float(up[offset]),
-                down_limit=_as_float(down[offset]),
-                suspended=bool(suspended[offset]),
-            )
-        return result
-
-    @lru_cache(maxsize=131_072)  # noqa: B019
-    def is_tradable(self, asset: Asset, session: str | pd.Timestamp) -> bool:
-        date = normalize_session(session)
-        row = self._row_index(asset.sid, date_to_int(date))
+        sessions: pd.DatetimeIndex,
+        reference_session: str | pd.Timestamp,
+    ) -> np.ndarray:
+        result = np.ones((len(sessions), len(assets)), dtype=float)
         if (
-            row is None
-            or not asset.is_alive_on(date)
-            or not self._bar_presence_array()[row]
+            self.adjustment is AdjustmentMode.RAW
+            or not len(sessions)
+            or not len(assets)
         ):
-            return False
-        volume = _as_float(self._full_column("daily", "volume")[row], 0.0)
-        suspended = bool(self._full_column("suspend_d", "suspended")[row])
-        return not suspended and volume > 0
+            return result
+        session_positions = self._sessions.get_indexer(sessions)
+        positions = self._asset_positions(assets)
+        valid_columns = np.flatnonzero(positions >= 0)
+        if not len(valid_columns) or bool((session_positions < 0).any()):
+            return result
 
-    def _extended_value(
-        self, asset: Asset, session: pd.Timestamp, field: str
-    ) -> object:
-        spec = self._extended_daily_spec(field)
-        assert spec is not None
-        is_string = spec["kind"] == "categorical"
-        if not asset.is_alive_on(session):
-            return None if is_string else np.nan
-        row = self._row_index(asset.sid, date_to_int(session))
-        if row is None:
-            return 0.0 if field == "stock_st.is_st" else None if is_string else np.nan
-        value = self._full_column(spec["role"], spec["column"])[row]
-        if is_string:
-            code = int(value)
-            categories = spec["categories"]
-            return categories[code] if 0 <= code < len(categories) else None
-        if spec["kind"] == "flag":
-            return float(value)
-        return _as_float(value)
+        valid_positions = positions[valid_columns]
+        factors = self._full_column("adj_factor", "adj_factor", valid_positions)
+        selected = factors[np.ix_(session_positions, valid_positions)].astype(
+            float, copy=True
+        )
+        missing_columns = np.flatnonzero(
+            (~np.isfinite(selected) | (selected <= 0)).any(axis=0)
+        )
+        session_dates = self._session_date_ints[session_positions]
+        for local_column in missing_columns:
+            asset = assets[int(valid_columns[local_column])]
+            dates, values = self._factor_series(asset.sid)
+            if not len(dates):
+                selected[:, local_column] = 1.0
+                continue
+            indices = np.searchsorted(dates, session_dates, side="right") - 1
+            visible = indices >= 0
+            selected[:, local_column] = 1.0
+            selected[visible, local_column] = values[indices[visible]]
+
+        if self.adjustment is AdjustmentMode.HFQ:
+            result[:, valid_columns] = selected
+            return result
+
+        reference_date = normalize_session(reference_session)
+        reference = (
+            reference_date.year * 10_000
+            + reference_date.month * 100
+            + reference_date.day
+        )
+        reference_position = int(
+            np.searchsorted(self._session_date_ints, reference, side="right") - 1
+        )
+        references = np.ones(len(valid_positions), dtype=float)
+        if reference_position >= 0:
+            direct = factors[reference_position, valid_positions].astype(float)
+            valid_direct = np.isfinite(direct) & (direct > 0)
+            references[valid_direct] = direct[valid_direct]
+            for local_column in np.flatnonzero(~valid_direct):
+                asset = assets[int(valid_columns[local_column])]
+                dates, values = self._factor_series(asset.sid)
+                index = int(np.searchsorted(dates, reference, side="right") - 1)
+                if index >= 0:
+                    references[local_column] = values[index]
+        result[:, valid_columns] = selected / references
+        return result
 
     def value(
         self,
@@ -722,19 +664,56 @@ class BundleDataPortal:
         reference_session: str | pd.Timestamp | None = None,
     ) -> object:
         date = normalize_session(session)
-        if "." in field:
-            return self._extended_value(asset, date, field)
-        if field not in _BASE_FIELDS:
-            raise KeyError(f"unknown daily bar field: {field}")
         if not asset.is_alive_on(date):
             return np.nan
+        session_position = self._sessions.get_indexer([date])[0]
+        asset_position = self._asset_position.get(asset.sid, -1)
+        if session_position < 0 or asset_position < 0:
+            return np.nan
+        if "." in field:
+            spec = self._extended_daily_spec(field)
+            assert spec is not None
+            raw = self._full_column(
+                spec["role"],
+                spec["column"],
+                np.asarray([asset_position], dtype=np.int64),
+            )[session_position, asset_position]
+            if spec["kind"] == "categorical":
+                categories = self._categories.get(
+                    f"{spec['role']}.{spec['column']}", ()
+                )
+                code = int(raw)
+                return categories[code] if 0 <= code < len(categories) else None
+            return float(raw)
+        if field not in _BASE_FIELDS:
+            raise KeyError(f"unknown daily bar field: {field}")
         role, column = _BASE_STORAGE[field]
-        value = _as_float(self._scalar(asset, date, role, column))
-        if adjusted and field in _ADJUSTED_PRICE_FIELDS and np.isfinite(value):
-            value *= self.adjustment_multiplier(
+        raw = _as_float(
+            self._full_column(
+                role, column, np.asarray([asset_position], dtype=np.int64)
+            )[session_position, asset_position]
+        )
+        if adjusted and field in _ADJUSTED_PRICE_FIELDS and np.isfinite(raw):
+            raw *= self.adjustment_multiplier(
                 asset, date, reference_session=reference_session
             )
-        return value
+        return raw
+
+    def prefetch(self, assets: Sequence[Asset], fields: Sequence[str]) -> None:
+        """Load fixed asset/field columns once for repeated cross-sectional access."""
+
+        positions = self._asset_positions(assets)
+        load_positions = positions[positions >= 0]
+        for field in fields:
+            if "." in field:
+                spec = self._extended_daily_spec(field)
+                assert spec is not None
+                self._full_column(spec["role"], spec["column"], load_positions)
+                continue
+            if field not in _BASE_FIELDS:
+                raise KeyError(f"unknown daily bar field: {field}")
+            role, column = _BASE_STORAGE[field]
+            self._full_column(role, column, load_positions)
 
     def values(
         self,
@@ -745,94 +724,68 @@ class BundleDataPortal:
         adjusted: bool = True,
         reference_session: str | pd.Timestamp | None = None,
     ) -> dict[str, np.ndarray]:
-        asset_list = list(assets)
-        date, rows, valid, alive = self._row_indices(asset_list, session)
-        needs_adjustment = adjusted and not (
-            self.adjustment is AdjustmentMode.RAW
-            or (self.adjustment is AdjustmentMode.QFQ and reference_session is None)
+        date = normalize_session(session)
+        session_position = self._sessions.get_indexer([date])[0]
+        positions = self._asset_positions(assets)
+        alive = self._alive(positions, pd.DatetimeIndex([date]))[0]
+        valid = alive & (positions >= 0) & (session_position >= 0)
+        load_positions = positions[positions >= 0]
+        output: dict[str, np.ndarray] = {}
+        adjustments = None
+        needs_adjustment = adjusted and (
+            self.adjustment is AdjustmentMode.HFQ
+            or (self.adjustment is AdjustmentMode.QFQ and reference_session is not None)
         )
-        multipliers: np.ndarray | None = None
         if needs_adjustment and any(
             field in _ADJUSTED_PRICE_FIELDS for field in fields
         ):
             reference = date if reference_session is None else reference_session
-            multipliers = self._adjustment_matrix(
-                asset_list, pd.DatetimeIndex([date]), reference
+            adjustments = self._adjustment_matrix(
+                assets, pd.DatetimeIndex([date]), reference
             )[0]
-        output: dict[str, np.ndarray] = {}
         for field in fields:
             if "." in field:
                 spec = self._extended_daily_spec(field)
                 assert spec is not None
                 if spec["kind"] == "categorical":
-                    values = np.full(len(asset_list), None, dtype=object)
+                    result = np.full(len(assets), None, dtype=object)
                 elif field == "stock_st.is_st":
-                    values = np.zeros(len(asset_list), dtype=float)
-                    values[~alive] = np.nan
+                    result = np.zeros(len(assets), dtype=float)
+                    result[~alive] = np.nan
                 else:
-                    values = np.full(len(asset_list), np.nan, dtype=float)
-                positions = np.flatnonzero(valid)
-                raw = self._column_values(spec["role"], spec["column"], rows[positions])
-                if spec["kind"] == "categorical":
-                    categories = spec["categories"]
-                    values[positions] = [
-                        categories[int(value)]
-                        if 0 <= int(value) < len(categories)
-                        else None
-                        for value in raw
-                    ]
-                else:
-                    values[positions] = np.asarray(raw, dtype=float)
-                output[field] = values
+                    result = np.full(len(assets), np.nan, dtype=float)
+                if valid.any():
+                    raw = self._full_column(
+                        spec["role"], spec["column"], load_positions
+                    )[session_position, positions[valid]]
+                    if spec["kind"] == "categorical":
+                        categories = self._categories.get(
+                            f"{spec['role']}.{spec['column']}", ()
+                        )
+                        result[valid] = [
+                            categories[int(value)]
+                            if 0 <= int(value) < len(categories)
+                            else None
+                            for value in raw
+                        ]
+                    else:
+                        result[valid] = raw.astype(float)
+                output[field] = result
                 continue
             if field not in _BASE_FIELDS:
                 raise KeyError(f"unknown daily bar field: {field}")
-            values = np.full(len(asset_list), np.nan, dtype=float)
-            positions = np.flatnonzero(valid)
-            if positions.size:
+            result = np.full(len(assets), np.nan, dtype=float)
+            if valid.any():
                 role, column = _BASE_STORAGE[field]
-                decoded = self._column_values(role, column, rows[positions]).astype(
-                    float
-                )
+                result[valid] = self._full_column(role, column, load_positions)[
+                    session_position, positions[valid]
+                ].astype(float)
                 if field in {"volume", "turnover"}:
-                    decoded = np.maximum(decoded, 0.0)
-                values[positions] = decoded
-                if multipliers is not None and field in _ADJUSTED_PRICE_FIELDS:
-                    values[positions] *= multipliers[positions]
-            output[field] = values
+                    result[valid] = np.maximum(result[valid], 0.0)
+                if adjustments is not None and field in _ADJUSTED_PRICE_FIELDS:
+                    result[valid] *= adjustments[valid]
+            output[field] = result
         return output
-
-    def _adjustment_matrix(
-        self,
-        assets: Sequence[Asset],
-        sessions: pd.DatetimeIndex,
-        reference_session: str | pd.Timestamp,
-    ) -> np.ndarray:
-        multipliers = np.ones((len(sessions), len(assets)), dtype=float)
-        if self.adjustment is AdjustmentMode.RAW or not len(sessions):
-            return multipliers
-        session_dates = dates_to_int(sessions)
-        reference = date_to_int(reference_session)
-        for asset_index, asset in enumerate(assets):
-            factor_dates, factor_values = self._factor_series(asset.sid)
-            if not len(factor_dates):
-                continue
-            indices = np.searchsorted(factor_dates, session_dates, side="right") - 1
-            visible = indices >= 0
-            factors = np.ones(len(sessions), dtype=float)
-            factors[visible] = factor_values[indices[visible]]
-            if self.adjustment is AdjustmentMode.HFQ:
-                multipliers[:, asset_index] = factors
-                continue
-            reference_index = (
-                int(np.searchsorted(factor_dates, reference, side="right")) - 1
-            )
-            reference_factor = (
-                float(factor_values[reference_index]) if reference_index >= 0 else 1.0
-            )
-            if reference_factor:
-                multipliers[:, asset_index] = factors / reference_factor
-        return multipliers
 
     def history(
         self,
@@ -846,86 +799,177 @@ class BundleDataPortal:
         asset_list = list(assets)
         field_list = list(fields)
         sessions = self.calendar.window(end_session, bar_count, include_end=True)
-        rows, valid, alive = self._row_matrix(asset_list, sessions)
-        extended = {
-            field: self._extended_daily_spec(field)
-            for field in field_list
-            if "." in field
-        }
-        has_strings = any(
-            spec is not None and spec["kind"] == "categorical"
-            for spec in extended.values()
+        session_positions, asset_positions, valid = self._matrix_locations(
+            asset_list, sessions
         )
+        alive = self._alive(asset_positions, sessions)
         adjustments = (
             self._adjustment_matrix(asset_list, sessions, end_session)
             if adjusted and any(field in _ADJUSTED_PRICE_FIELDS for field in field_list)
             else None
         )
         matrices: dict[str, np.ndarray] = {}
+        has_strings = False
         for field in field_list:
-            spec = extended.get(field)
-            if spec is not None:
+            if "." in field:
+                spec = self._extended_daily_spec(field)
+                assert spec is not None
                 if spec["kind"] == "categorical":
-                    values = np.full(rows.shape, None, dtype=object)
+                    has_strings = True
+                    matrix = np.full(valid.shape, None, dtype=object)
                 elif field == "stock_st.is_st":
-                    values = np.zeros(rows.shape, dtype=float)
-                    values[~alive] = np.nan
+                    matrix = np.zeros(valid.shape, dtype=float)
+                    matrix[~alive] = np.nan
                 else:
-                    values = np.full(rows.shape, np.nan, dtype=float)
-                if valid.any():
-                    raw = self._full_column(spec["role"], spec["column"])[rows[valid]]
+                    matrix = np.full(valid.shape, np.nan, dtype=float)
+                rows, cols = np.where(valid)
+                if len(rows):
+                    raw = self._full_column(
+                        spec["role"], spec["column"], asset_positions[cols]
+                    )[session_positions[rows], asset_positions[cols]]
                     if spec["kind"] == "categorical":
-                        categories = spec["categories"]
-                        values[valid] = [
+                        categories = self._categories.get(
+                            f"{spec['role']}.{spec['column']}", ()
+                        )
+                        matrix[rows, cols] = [
                             categories[int(value)]
                             if 0 <= int(value) < len(categories)
                             else None
                             for value in raw
                         ]
                     else:
-                        values[valid] = np.asarray(raw, dtype=float)
-                matrices[field] = values
+                        matrix[rows, cols] = raw.astype(float)
+                matrices[field] = matrix
                 continue
             if field not in _BASE_FIELDS:
                 raise KeyError(f"unknown daily bar field: {field}")
-            values = np.full(rows.shape, np.nan, dtype=float)
-            if valid.any():
+            matrix = np.full(valid.shape, np.nan, dtype=float)
+            rows, cols = np.where(valid)
+            if len(rows):
                 role, column = _BASE_STORAGE[field]
-                decoded = self._full_column(role, column)[rows[valid]].astype(float)
+                matrix[rows, cols] = self._full_column(
+                    role, column, asset_positions[cols]
+                )[session_positions[rows], asset_positions[cols]].astype(float)
                 if field in {"volume", "turnover"}:
-                    decoded = np.maximum(decoded, 0.0)
-                values[valid] = decoded
+                    matrix[rows, cols] = np.maximum(matrix[rows, cols], 0.0)
                 if adjustments is not None and field in _ADJUSTED_PRICE_FIELDS:
-                    values[valid] *= adjustments[valid]
-            matrices[field] = values
-
+                    matrix[rows, cols] *= adjustments[rows, cols]
+            matrices[field] = matrix
         columns = pd.MultiIndex.from_product(
             [[asset.ts_code for asset in asset_list], field_list],
             names=["asset", "field"],
         )
         result = pd.DataFrame(
-            index=sessions,
-            columns=columns,
-            dtype=object if has_strings else float,
+            index=sessions, columns=columns, dtype=object if has_strings else float
         )
         for field, matrix in matrices.items():
-            for asset_index, asset in enumerate(asset_list):
-                result[(asset.ts_code, field)] = matrix[:, asset_index]
+            for index, asset in enumerate(asset_list):
+                result[(asset.ts_code, field)] = matrix[:, index]
         if has_strings:
             for asset in asset_list:
                 for field in field_list:
-                    spec = extended.get(field)
+                    spec = _DAILY_FIELDS.get(field)
                     if spec is None or spec["kind"] != "categorical":
                         result[(asset.ts_code, field)] = pd.to_numeric(
                             result[(asset.ts_code, field)], errors="coerce"
                         ).astype(float)
         return result
 
-    def _financial_array(self, asset: Asset, table: str) -> np.ndarray:
-        group = self._h5["finance"]["data"].get(table)
-        if group is None or asset.ts_code not in group:
-            return np.array([], dtype=[])
-        return np.asarray(group[asset.ts_code][:])
+    @lru_cache(maxsize=131_072)  # noqa: B019
+    def raw_bar(self, asset: Asset, session: str | pd.Timestamp):
+        date = normalize_session(session)
+        if not asset.is_alive_on(date):
+            return None
+        fields = self.values(
+            [asset],
+            date,
+            [
+                "open",
+                "high",
+                "low",
+                "close",
+                "pre_close",
+                "volume",
+                "turnover",
+                "up_limit",
+                "down_limit",
+                "suspended",
+            ],
+            adjusted=False,
+        )
+        suspended_value = _as_float(fields["suspended"][0], 0.0)
+        if not any(
+            np.isfinite(fields[name][0]) for name in ("open", "high", "low", "close")
+        ) and not bool(suspended_value):
+            return None
+        return self._daily_bar_type(
+            asset=asset,
+            session=date,
+            open=_as_float(fields["open"][0]),
+            high=_as_float(fields["high"][0]),
+            low=_as_float(fields["low"][0]),
+            close=_as_float(fields["close"][0]),
+            pre_close=_as_float(fields["pre_close"][0]),
+            volume=max(0.0, _as_float(fields["volume"][0], 0.0)),
+            turnover=max(0.0, _as_float(fields["turnover"][0], 0.0)),
+            up_limit=_as_float(fields["up_limit"][0]),
+            down_limit=_as_float(fields["down_limit"][0]),
+            suspended=bool(suspended_value),
+        )
+
+    def execution_bars(
+        self, assets: Sequence[Asset], session: str | pd.Timestamp, execution_field: str
+    ) -> dict[Asset, Any]:
+        if execution_field not in {"open", "close"}:
+            raise ValueError("execution_field must be open or close")
+        fields = self.values(
+            assets,
+            session,
+            [execution_field, "volume", "up_limit", "down_limit", "suspended"],
+            adjusted=False,
+        )
+        result: dict[Asset, Any] = {}
+        date = normalize_session(session)
+        for index, asset in enumerate(assets):
+            price = _as_float(fields[execution_field][index])
+            suspended = bool(_as_float(fields["suspended"][index], 0.0))
+            if not np.isfinite(price) and not suspended:
+                result[asset] = None
+                continue
+            result[asset] = self._daily_bar_type(
+                asset=asset,
+                session=date,
+                open=price if execution_field == "open" else np.nan,
+                high=np.nan,
+                low=np.nan,
+                close=price if execution_field == "close" else np.nan,
+                pre_close=np.nan,
+                volume=max(0.0, _as_float(fields["volume"][index], 0.0)),
+                turnover=0.0,
+                up_limit=_as_float(fields["up_limit"][index]),
+                down_limit=_as_float(fields["down_limit"][index]),
+                suspended=suspended,
+            )
+        return result
+
+    @lru_cache(maxsize=131_072)  # noqa: B019
+    def is_tradable(self, asset: Asset, session: str | pd.Timestamp) -> bool:
+        bar = self.raw_bar(asset, session)
+        return bar is not None and not bar.suspended and bar.volume > 0
+
+    def _financial_frame(self, asset: Asset, table: str) -> pd.DataFrame:
+        key = (asset.sid, table)
+        cached = self._finance_cache.get(key)
+        if cached is not None:
+            return cached
+        spec = FINANCE_SPECS[table]
+        selected = ", ".join(f'"{column}"' for column in spec.column_names)
+        frame = self._connection.execute(
+            f'SELECT {selected} FROM "{table}" WHERE ts_code = ? ORDER BY end_date, effective_ann_date, source_order',
+            [asset.ts_code],
+        ).fetchdf()
+        self._finance_cache[key] = frame
+        return frame
 
     def _financial_frame_for_table(
         self,
@@ -939,51 +983,44 @@ class BundleDataPortal:
         report_type: str | None = "1",
     ) -> pd.DataFrame:
         date = normalize_session(session)
+        columns = [field for field, _ in fields]
         if not asset.is_alive_on(date):
-            return pd.DataFrame(columns=[field for field, _ in fields])
-        values = self._financial_array(asset, table)
-        if not len(values):
-            return pd.DataFrame(columns=[field for field, _ in fields])
-        date_int = date_to_int(date)
-        mask = (values["effective_ann_date"] < date_int) & (
-            values["end_date"] <= date_int
-        )
+            return pd.DataFrame(columns=columns)
+        frame = self._financial_frame(asset, table)
+        if frame.empty:
+            return pd.DataFrame(columns=columns)
+        date_text = date.strftime("%Y%m%d")
+        visible = frame[
+            (frame["effective_ann_date"].astype(str) < date_text)
+            & (frame["end_date"].astype(str) <= date_text)
+        ].copy()
         if table != "fina_indicator" and report_type is not None:
-            reports = np.array(
-                [_decode_bytes(value) for value in values["report_type"]]
-            )
-            mask &= reports == str(report_type)
+            visible = visible[visible["report_type"].astype(str) == str(report_type)]
         if end_date is not None:
-            mask &= values["end_date"] == date_to_int(end_date)
-        visible = values[mask]
-        if not len(visible):
-            return pd.DataFrame(columns=[field for field, _ in fields])
-        frame = pd.DataFrame(
-            {
-                "end_date": visible["end_date"],
-                "effective_ann_date": visible["effective_ann_date"],
-                "update_rank": np.array(
-                    [
-                        1 if _decode_bytes(value) == "1" else 0
-                        for value in visible["update_flag"]
-                    ]
-                ),
-                "source_order": visible["source_order"],
-                **{field: visible[column] for field, column in fields},
-            }
-        )
-        frame = (
-            frame.sort_values(
+            visible = visible[
+                visible["end_date"].astype(str) == end_date.strftime("%Y%m%d")
+            ]
+        if visible.empty:
+            return pd.DataFrame(columns=columns)
+        visible["update_rank"] = (visible["update_flag"].astype(str) == "1").astype(int)
+        visible = (
+            visible.sort_values(
                 ["end_date", "effective_ann_date", "update_rank", "source_order"],
                 ascending=[False, False, False, False],
+                kind="stable",
             )
             .drop_duplicates("end_date", keep="first")
             .head(periods)
         )
-        frame["end_date"] = pd.to_datetime(
-            frame["end_date"].astype(str), format="%Y%m%d"
+        result = pd.DataFrame(
+            {
+                field: pd.to_numeric(visible[column], errors="coerce").to_numpy()
+                for field, column in fields
+            }
         )
-        return frame.set_index("end_date")[[field for field, _ in fields]]
+        result.index = pd.to_datetime(visible["end_date"].astype(str), format="%Y%m%d")
+        result.index.name = "end_date"
+        return result
 
     def fundamental(
         self,
@@ -1046,39 +1083,19 @@ class BundleDataPortal:
             .reindex(columns=names)
         )
 
-    def _index_values(self, code: str) -> np.ndarray:
-        cached = self._index_arrays.get(code)
+    def _index_values(self, code: str) -> pd.DataFrame:
+        key = code.upper().strip()
+        cached = self._index_arrays.get(key)
         if cached is not None:
             return cached
-        group = self._h5["index_weight"]["data"]
-        if code not in group:
+        if key not in self._index_constituent_codes:
             raise KeyError(f"index constituents are unavailable for {code!r}")
-        values = np.asarray(group[code][:])
-        values.setflags(write=False)
-        self._index_arrays[code] = values
-        return values
-
-    @lru_cache(maxsize=32_768)  # noqa: B019
-    def _index_rows(
-        self, index_code: str, session_int: int
-    ) -> tuple[tuple[str, int | None, float, int], ...]:
-        code = index_code.upper().strip()
-        values = self._index_values(code)
-        dates = values["snapshot_date"]
-        position = int(np.searchsorted(dates, session_int, side="left") - 1)
-        if position < 0:
-            return ()
-        snapshot = int(dates[position])
-        selected = values[dates == snapshot]
-        return tuple(
-            (
-                _decode_bytes(row["con_code"]),
-                int(row["sid"]) if int(row["sid"]) >= 0 else None,
-                float(row["weight"]),
-                snapshot,
-            )
-            for row in selected
-        )
+        frame = self._connection.execute(
+            "SELECT con_code, trade_date, weight FROM index_weight WHERE index_code = ? ORDER BY trade_date, con_code",
+            [key],
+        ).fetchdf()
+        self._index_arrays[key] = frame
+        return frame
 
     def index_constituents(
         self, index_code: str, session: str | pd.Timestamp
@@ -1087,8 +1104,11 @@ class BundleDataPortal:
         if date > self.backtest_end:
             raise DataError("index constituent query cannot exceed backtest end")
         code = index_code.upper().strip()
-        rows = self._index_rows(code, date_to_int(date))
-        if not rows:
+        values = self._index_values(code)
+        visible_dates = values.loc[
+            values["trade_date"].astype(str) < date.strftime("%Y%m%d"), "trade_date"
+        ]
+        if visible_dates.empty:
             empty = pd.DataFrame(
                 {
                     "asset": pd.Series(dtype=object),
@@ -1099,83 +1119,81 @@ class BundleDataPortal:
             )
             empty.attrs["index_code"] = code
             return empty
-
-        snapshot = rows[0][3]
+        snapshot = str(visible_dates.max())
         cache_key = (code, snapshot)
         cached = self._index_frames.get(cache_key)
         if cached is None:
-            result_rows = []
-            for con_code, sid, weight, _ in rows:
-                asset = None
-                if sid is not None:
-                    try:
-                        asset = self.asset_finder.retrieve_asset(sid)
-                    except LookupError:
-                        pass
-                result_rows.append(
+            selected = values[values["trade_date"].astype(str) == snapshot]
+            rows = []
+            for row in selected.itertuples(index=False):
+                try:
+                    asset = self.asset_finder.retrieve_asset(str(row.con_code))
+                except LookupError:
+                    asset = None
+                rows.append(
                     {
-                        "ts_code": con_code,
+                        "ts_code": str(row.con_code),
                         "asset": asset,
-                        "weight": weight,
-                        "snapshot_date": pd.to_datetime(str(snapshot), format="%Y%m%d"),
+                        "weight": float(row.weight),
+                        "snapshot_date": pd.to_datetime(snapshot, format="%Y%m%d"),
                     }
                 )
-            cached = pd.DataFrame(result_rows).set_index("ts_code")
+            cached = pd.DataFrame(rows).set_index("ts_code")[
+                ["asset", "weight", "snapshot_date"]
+            ]
             cached.attrs.update(
                 {
                     "index_code": code,
-                    "snapshot_date": cached["snapshot_date"].iloc[0],
+                    "snapshot_date": pd.to_datetime(snapshot, format="%Y%m%d"),
                     "weight_unit": "percent",
                 }
             )
-            cached = cached[["asset", "weight", "snapshot_date"]]
             self._index_frames[cache_key] = cached
-            self._index_frames.move_to_end(cache_key)
             while len(self._index_frames) > _INDEX_FRAME_CACHE_SIZE:
                 self._index_frames.popitem(last=False)
-        else:
-            self._index_frames.move_to_end(cache_key)
         result = cached.copy(deep=True)
         result.attrs = dict(cached.attrs)
         return result
 
     def benchmark_returns(self, code: str, sessions: pd.DatetimeIndex) -> pd.Series:
-        key = code.upper().strip()
-        group = self._h5["daily"]["data"]
-        if key not in group:
+        frame = self._connection.execute(
+            "SELECT trade_date, close FROM index_daily WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date",
+            [
+                code.upper().strip(),
+                sessions[0].strftime("%Y%m%d"),
+                sessions[-1].strftime("%Y%m%d"),
+            ],
+        ).fetchdf()
+        if frame.empty:
             raise DataError(f"benchmark {code!r} is unavailable")
-        dataset = group[key]
-        dates = pd.to_datetime(
-            _field_array(dataset, "trade_date").astype(str), format="%Y%m%d"
-        )
-        closes = _field_array(dataset, "close").astype(float)
-        prices = pd.Series(closes, index=dates, name="benchmark_price").reindex(
-            sessions
-        )
-        if prices.notna().sum() < 2:
+        if len(frame) < 2:
             raise DataError(f"benchmark {code!r} has fewer than two price observations")
+        prices = pd.Series(
+            pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype=float),
+            index=pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d"),
+            name="benchmark_price",
+        ).reindex(sessions)
         return prices.ffill().pct_change(fill_method=None).fillna(0.0)
 
     def clear_cache(self) -> None:
         for name in (
             "_session_location",
-            "_row_index",
             "_factor_series",
             "factor",
             "raw_bar",
             "is_tradable",
-            "_index_rows",
         ):
             method = getattr(self, name, None)
             if method is not None and hasattr(method, "cache_clear"):
                 method.cache_clear()
-        if getattr(self, "_column_cache", None) is not None:
-            self._column_cache.clear()
-            self._column_cache_bytes = 0
-        if getattr(self, "_query_plans", None) is not None:
-            self._query_plans.clear()
-        if getattr(self, "_index_arrays", None) is not None:
-            self._index_arrays.clear()
-        if getattr(self, "_index_frames", None) is not None:
-            self._index_frames.clear()
+        self._column_cache.clear()
+        self._column_cache_bytes = 0
+        self._loaded_positions.clear()
+        self._categories.clear()
+        self._finance_cache.clear()
+        self._index_arrays.clear()
+        self._index_frames.clear()
         self._bar_presence = None
+
+
+TushareDataPortal = BundleDataPortal

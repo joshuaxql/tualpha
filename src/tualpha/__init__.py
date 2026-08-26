@@ -4,12 +4,17 @@ from .api import (
     cancel_order,
     get_open_orders,
     order,
+    order_many,
     order_percent,
+    order_percent_many,
     order_target,
     order_target_many,
     order_target_percent,
+    order_target_percent_many,
     order_target_value,
+    order_target_value_many,
     order_value,
+    order_value_many,
     record,
     set_commission,
     symbol,
@@ -17,6 +22,7 @@ from .api import (
 from .assets import Asset, AssetFinder, AssetType, Board
 from .config import AdjustmentMode, BacktestConfig, ExecutionTime, PlotlyJsMode
 from .costs import ChinaFeeModel, RateSchedule
+from .data.query import LocalDataClient, local_data
 from .engine import AlgorithmContext, TradingAlgorithm, run_algorithm
 from .exceptions import (
     ConfigurationError,
@@ -25,7 +31,14 @@ from .exceptions import (
     SymbolNotFound,
     TualphaError,
 )
-from .models import Order, OrderStatus, Portfolio, RejectReason, Transaction
+from .models import (
+    Order,
+    OrderSizing,
+    OrderStatus,
+    Portfolio,
+    RejectReason,
+    Transaction,
+)
 from .result import BacktestResult
 
 __all__ = [
@@ -41,8 +54,10 @@ __all__ = [
     "ConfigurationError",
     "DataError",
     "ExecutionTime",
+    "LocalDataClient",
     "NoActiveAlgorithm",
     "Order",
+    "OrderSizing",
     "OrderStatus",
     "PlotlyJsMode",
     "Portfolio",
@@ -54,20 +69,26 @@ __all__ = [
     "TualphaError",
     "cancel_order",
     "get_open_orders",
+    "local_data",
     "order",
+    "order_many",
     "order_percent",
+    "order_percent_many",
     "order_target",
     "order_target_many",
     "order_target_percent",
+    "order_target_percent_many",
     "order_target_value",
+    "order_target_value_many",
     "order_value",
+    "order_value_many",
     "record",
     "run_algorithm",
     "set_commission",
     "symbol",
 ]
 
-__version__ = "0.8.1"
+__version__ = "1.3.0"
 
 
 def main() -> None:

@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from ._calendar_store import SessionCalendar, load_bundle_calendar
-from ._hdf5_store import load_assets_manifest
-from .bundle import (
+from ..exceptions import DataError
+from .bundle.calendar_store import SessionCalendar, load_bundle_calendar
+from .bundle.manager import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,
     latest_bundle_path,
     release_bundle_read_lock,
 )
-from .exceptions import DataError
+from .bundle.parquet_store import load_manifest
 
 
 class ChinaTradingCalendar:
@@ -24,7 +24,7 @@ class ChinaTradingCalendar:
         lock_key, _ = acquire_bundle_read_lock(bundle_root, bundle_name)
         try:
             self.bundle_path = latest_bundle_path(bundle_root, bundle_name)
-            manifest = load_assets_manifest(self.bundle_path / "assets.pk")
+            manifest = load_manifest(self.bundle_path)
             self.bundle_generation = str(manifest["generation"])
             self._calendar: SessionCalendar = load_bundle_calendar(self.bundle_path)
             self._sessions = self._calendar.sessions

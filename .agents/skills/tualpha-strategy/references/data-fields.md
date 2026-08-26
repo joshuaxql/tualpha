@@ -1,6 +1,6 @@
-# TuAlpha 策略数据字段
+# TuAlpha 1.3 策略数据字段
 
-策略只使用 API 逻辑字段，不直接读取 HDF5、NumPy 或 Pickle Bundle 文件。当前 Bundle 的精确字段以 `data.available_fields()` 为准。物理布局见 [Bundle 格式](../../../bundle-format.md)。
+策略只使用 API 逻辑字段，不直接读取 Parquet 或 DuckDB Catalog 文件。当前 Bundle 的精确字段以 `data.available_fields()` 为准。物理布局见 [Bundle 格式](../../../../docs/bundle-format.md)。
 
 ## 标准日线字段
 

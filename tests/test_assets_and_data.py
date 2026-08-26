@@ -1,24 +1,18 @@
 from __future__ import annotations
 
+import json
 import shutil
 from importlib.util import find_spec
 from pathlib import Path
 
-import h5py
 import pandas as pd
 import pytest
 
-from tualpha import _data_v8
-from tualpha._hdf5_store import (
-    HDF5_FILES,
-    REQUIRED_BUNDLE_FILES,
-    load_assets_manifest,
-    write_assets_manifest,
-)
 from tualpha.assets import AssetFinder, Board
 from tualpha.bundle import latest_bundle_path
 from tualpha.calendar import ChinaTradingCalendar
 from tualpha.data import BarData, TushareDataPortal
+from tualpha.data.bundle.parquet_store import load_manifest
 from tualpha.exceptions import DataError
 
 
@@ -126,74 +120,35 @@ def test_vectorized_current_matches_scalar_values_and_uses_bounded_cache(
     with pytest.raises(ValueError, match="read-only"):
         arrays["close"][0] = -1.0
 
+    portal.clear_cache()
+    data.prefetch(assets, ["close", "stock_st.is_st"])
+    positions = portal._asset_positions(assets)
+    assert portal._loaded_positions["daily.close"][positions].all()
+    assert portal._loaded_positions["stock_st.is_st"][positions].all()
     assert portal._column_cache
     assert portal._column_cache_bytes <= portal._column_cache_max_bytes
     assert all(not values.flags.writeable for values in portal._column_cache.values())
-    assert portal._query_plan(assets) is portal._query_plan(tuple(assets))
+    assert (
+        portal._asset_positions(assets).tolist()
+        == portal._asset_positions(tuple(assets)).tolist()
+    )
     portal.clear_cache()
     assert not portal._column_cache
     assert portal._column_cache_bytes == 0
     portal.close()
 
 
-def test_schema7_reader_falls_back_when_packed_acceleration_is_absent(
-    data_root: Path, tmp_path: Path
-) -> None:
-    fallback_root = tmp_path / "fallback"
-    fallback_bundle = fallback_root / "bundle"
-    shutil.copytree(latest_bundle_path(data_root), fallback_bundle)
-    manifest = load_assets_manifest(fallback_bundle / "assets.pk")
-    manifest.pop("packed_acceleration", None)
-    for filename in HDF5_FILES:
-        with h5py.File(fallback_bundle / filename, "r+") as handle:
-            if "packed" in handle:
-                del handle["packed"]
-            for attribute in ("packed_layout", "packed_fields"):
-                if attribute in handle.attrs:
-                    del handle.attrs[attribute]
-        manifest["files"][filename]["size"] = (
-            (fallback_bundle / filename).stat().st_size
-        )
-    write_assets_manifest(fallback_bundle / "assets.pk", manifest)
-
-    finder = AssetFinder(fallback_root)
-    calendar = ChinaTradingCalendar(fallback_root)
-    stock = finder.retrieve_asset("000001.SZ")
-    portal = TushareDataPortal(fallback_root, finder, calendar, "raw", "2024-01-08")
-    assert portal.value(stock, "2024-01-03", "close") == 11.0
-    assert pd.isna(portal.value(stock, "2024-01-03", "daily_basic.total_mv"))
-    portal.close()
-
-
-def test_packed_hot_columns_do_not_scan_per_security_datasets(
-    data_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_duckdb_columns_are_loaded_once_and_cached(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)
-    assets = [
-        finder.retrieve_asset(code) for code in ("000001.SZ", "688001.SH", "510300.SH")
-    ]
     portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
 
-    def fail_per_security_read(*args: object, **kwargs: object) -> object:
-        raise AssertionError("packed hot columns must not scan data/<ts_code>")
+    first = portal._full_column("daily", "close")
+    second = portal._full_column("daily", "close")
 
-    monkeypatch.setattr(_data_v8, "_field_array", fail_per_security_read)
-    values = portal.values(
-        assets,
-        "2024-01-03",
-        [
-            "open",
-            "close",
-            "volume",
-            "up_limit",
-            "down_limit",
-            "suspended",
-            "daily_basic.total_mv",
-            "stock_st.is_st",
-        ],
-    )
-    assert values["close"].tolist() == pytest.approx([11.0, 20.0, 4.0])
+    assert first is second
+    assert not first.flags.writeable
+    assert first.shape == (len(calendar.sessions), len(finder))
     portal.close()
 
 
@@ -310,18 +265,28 @@ def test_index_constituents_are_strictly_point_in_time(data_root: Path) -> None:
     portal.close()
 
 
-def test_bundle_has_only_schema7_protocol_files(data_root: Path) -> None:
+def test_bundle_has_parquet_and_duckdb_only(data_root: Path) -> None:
     path = latest_bundle_path(data_root)
-    assert {entry.name for entry in path.iterdir()} == REQUIRED_BUNDLE_FILES
-    assert not any("bcolz" in entry.name.lower() for entry in path.iterdir())
+    assert {entry.name for entry in path.iterdir()} == {
+        "catalog.duckdb",
+        "manifest.json",
+        "parquet",
+    }
+    assert list(path.rglob("*.parquet"))
+    assert not list(path.rglob("*.h5"))
 
 
-def test_portal_rejects_mixed_hdf5_generation(data_root: Path, tmp_path: Path) -> None:
+def test_portal_rejects_mixed_catalog_generation(
+    data_root: Path, tmp_path: Path
+) -> None:
     mixed_root = tmp_path / "mixed-generation"
     mixed_path = mixed_root / "bundle"
     shutil.copytree(latest_bundle_path(data_root), mixed_path)
-    with h5py.File(mixed_path / "daily.h5", "r+") as handle:
-        handle.attrs["generation"] = "stale-generation"
+    manifest = load_manifest(mixed_path)
+    manifest["generation"] = "stale-generation"
+    (mixed_path / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
     with pytest.raises(DataError, match="incomplete"):
         AssetFinder(mixed_root)
 
@@ -334,8 +299,8 @@ def test_portal_rejects_mixed_bundle_generations(data_root: Path) -> None:
         TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
 
 
-def test_runtime_has_no_duckdb_dependency(data_root: Path) -> None:
-    assert find_spec("duckdb") is None
+def test_runtime_uses_duckdb_dependency(data_root: Path) -> None:
+    assert find_spec("duckdb") is not None
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)
     stock = finder.retrieve_asset("000001.SZ")

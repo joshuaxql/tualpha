@@ -8,22 +8,22 @@ from collections.abc import Iterable
 
 import pandas as pd
 
-from .assets import Asset
-from .calendar import ChinaTradingCalendar
-from .costs import ChinaFeeModel
-from .data import TushareDataPortal
-from .exceptions import DataError
-from .models import (
-    ClosedTrade,
+from ..data.portal import TushareDataPortal
+from ..data.trading_calendar import ChinaTradingCalendar
+from ..exceptions import DataError
+from ..model.asset import Asset
+from ..model.order import (
     FeeBreakdown,
     Order,
+    OrderSizing,
     OrderStatus,
-    Portfolio,
-    Position,
     RejectReason,
     Transaction,
 )
-from .rules import ChinaMarketRules
+from ..model.portfolio import ClosedTrade, Portfolio, Position
+from .costs import ChinaFeeModel
+from .market_rules import ChinaMarketRules
+from .matcher import DailyBarMatcher
 
 _EPSILON = 1e-6
 
@@ -45,9 +45,15 @@ class SimulationBroker:
         self.portfolio = portfolio
         self.calendar = calendar
         self.data_portal = data_portal
-        self.fee_model = fee_model
+        self._fee_model = fee_model
         self.market_rules = market_rules
         self.execution_field = execution_field
+        self.matcher = DailyBarMatcher(
+            portfolio,
+            fee_model,
+            market_rules,
+            execution_field,
+        )
         self.orders: list[Order] = []
         self._open_orders: dict[int, Order] = {}
         self.transactions: list[Transaction] = []
@@ -56,29 +62,53 @@ class SimulationBroker:
             FeeBreakdown
         )
 
+    @property
+    def fee_model(self) -> ChinaFeeModel:
+        return self._fee_model
+
+    @fee_model.setter
+    def fee_model(self, model: ChinaFeeModel) -> None:
+        self._fee_model = model
+        self.matcher.fee_model = model
+
     def _append_order(
         self,
         asset: Asset,
-        amount: float,
+        requested: float,
         created_session: pd.Timestamp,
         eligible_session: pd.Timestamp,
         *,
+        sizing: OrderSizing = OrderSizing.QUANTITY,
         position_limit: int | None = None,
         cash_adaptive: bool = False,
+        is_batch: bool = False,
+        is_target: bool = False,
     ) -> Order:
-        numeric_amount = float(amount)
+        numeric_request = float(requested)
+        initial_amount = (
+            numeric_request
+            if sizing in {OrderSizing.QUANTITY, OrderSizing.TARGET_QUANTITY}
+            else 0.0
+        )
         order = Order(
             asset=asset,
-            amount=numeric_amount,
+            amount=initial_amount,
             created_session=created_session,
             eligible_session=eligible_session,
             position_limit=position_limit,
             cash_adaptive=cash_adaptive,
+            sizing=sizing,
+            requested=numeric_request,
+            is_batch=is_batch,
+            is_target=is_target,
         )
-        if not math.isfinite(numeric_amount):
-            order.reject(RejectReason.INVALID_LOT, "委托数量必须为有限数值")
-        elif abs(numeric_amount) <= _EPSILON:
-            order.reject(RejectReason.ZERO_AMOUNT, "委托数量为零")
+        if not math.isfinite(numeric_request):
+            order.reject(RejectReason.INVALID_LOT, "委托参数必须为有限数值")
+        elif abs(numeric_request) <= _EPSILON and not (
+            is_target
+            and sizing in {OrderSizing.TARGET_VALUE, OrderSizing.TARGET_PERCENT}
+        ):
+            order.reject(RejectReason.ZERO_AMOUNT, "委托参数为零")
         self.orders.append(order)
         if order.open:
             self._open_orders[order.id] = order
@@ -87,23 +117,31 @@ class SimulationBroker:
     def submit(
         self,
         asset: Asset,
-        amount: float,
+        requested: float,
         created_session: pd.Timestamp,
         eligible_session: pd.Timestamp,
         *,
+        sizing: OrderSizing = OrderSizing.QUANTITY,
+        position_limit: int | None = None,
         cash_adaptive: bool = False,
+        is_batch: bool = False,
+        is_target: bool = False,
     ) -> Order:
         return self._append_order(
             asset,
-            amount,
+            requested,
             created_session,
             eligible_session,
+            sizing=sizing,
+            position_limit=position_limit,
             cash_adaptive=cash_adaptive,
+            is_batch=is_batch,
+            is_target=is_target,
         )
 
     def submit_many(
         self,
-        orders: Iterable[tuple[Asset, float]],
+        orders: Iterable[tuple[Asset, float, OrderSizing, bool]],
         created_session: pd.Timestamp,
         eligible_session: pd.Timestamp,
         position_limit: int | None = None,
@@ -115,13 +153,16 @@ class SimulationBroker:
         return [
             append(
                 asset,
-                amount,
+                requested,
                 created_session,
                 eligible_session,
+                sizing=sizing,
                 position_limit=position_limit,
                 cash_adaptive=cash_adaptive,
+                is_batch=True,
+                is_target=is_target,
             )
-            for asset, amount in orders
+            for asset, requested, sizing, is_target in orders
         ]
 
     def cancel(self, order: Order) -> None:
@@ -166,37 +207,25 @@ class SimulationBroker:
             adjusted_amount = position.amount
             for order in liquidation_orders:
                 order.amount = order.filled - adjusted_amount
+                order.requested = order.amount
 
-    def _reject(self, order: Order, failure: tuple[RejectReason, str] | None) -> bool:
-        if failure is None:
-            return False
-        order.reject(*failure)
-        return True
-
-    def _affordable_buy_quantity(
-        self, asset: Asset, requested: float, price: float, session: pd.Timestamp
+    def _pre_match_equity(
+        self,
+        session: pd.Timestamp,
+        bars: dict[Asset, object],
     ) -> float:
-        requested = self.market_rules.normalize_buy(asset, requested)
-        if requested <= 0:
-            return 0.0
-        fees = self.fee_model.calculate(
-            asset, requested * price, is_sell=False, session=session
-        )
-        if requested * price + fees.total <= self.portfolio.cash + _EPSILON:
-            return requested
-
-        rough = max(0.0, self.portfolio.cash / price)
-        quantity = self.market_rules.normalize_buy(asset, min(requested, rough))
-        # Fee minima and cent rounding can leave the rough estimate a few shares high.
-        step = 1.0 if self.market_rules.allows_single_share_increment(asset) else 100.0
-        while quantity > 0:
-            fees = self.fee_model.calculate(
-                asset, quantity * price, is_sell=False, session=session
-            )
-            if quantity * price + fees.total <= self.portfolio.cash + _EPSILON:
-                return quantity
-            quantity = self.market_rules.normalize_buy(asset, quantity - step)
-        return 0.0
+        value = self.portfolio.cash
+        for asset, position in self.portfolio.positions.items():
+            if not asset.is_alive_on(session):
+                continue
+            price = position.last_sale_price
+            bar = bars.get(asset)
+            if bar is not None:
+                candidate = bar.value(self.execution_field)
+                if pd.notna(candidate) and candidate > 0:
+                    price = float(candidate)
+            value += position.amount * max(0.0, price)
+        return value
 
     def process_orders(self, session: pd.Timestamp) -> list[Transaction]:
         fills: list[Transaction] = []
@@ -205,11 +234,16 @@ class SimulationBroker:
             for order in self._open_orders.values()
             if order.open and order.eligible_session <= session
         ]
+        if not eligible:
+            return fills
+        requested_assets = [order.asset for order in eligible]
+        held_assets = list(self.portfolio.positions)
         bars = self.data_portal.execution_bars(
-            list(dict.fromkeys(order.asset for order in eligible)),
+            list(dict.fromkeys([*held_assets, *requested_assets])),
             session,
             self.execution_field,
         )
+        pre_match_equity = self._pre_match_equity(session, bars)
         active_position_count = sum(
             1
             for asset, position in self.portfolio.positions.items()
@@ -225,68 +259,26 @@ class SimulationBroker:
                     RejectReason.ASSET_NOT_ALIVE, "证券在成交日尚未上市或已经退市"
                 )
                 continue
-            bar = bars.get(asset)
-            if self._reject(
-                order,
-                self.market_rules.validate_market(
-                    asset,
-                    bar,
-                    is_buy=order.is_buy,
-                    execution_field=self.execution_field,
-                ),
-            ):
-                continue
-            assert bar is not None  # validated above
-            price = bar.value(self.execution_field)
-            requested = abs(order.remaining)
             position = self.portfolio.position(asset)
-            position_amount = position.amount if position is not None else 0.0
-
-            if self._reject(
+            opens_new_position = position is None or position.amount <= _EPSILON
+            matched = self.matcher.match(
                 order,
-                self.market_rules.validate_quantity(
-                    asset,
-                    requested,
-                    is_buy=order.is_buy,
-                    position_amount=position_amount,
-                ),
-            ):
+                bars.get(asset),
+                session,
+                pre_match_equity,
+                active_position_count,
+            )
+            if matched is None:
                 continue
-
-            if order.is_buy:
-                opens_new_position = position is None or position_amount <= _EPSILON
-                if (
-                    opens_new_position
-                    and order.position_limit is not None
-                    and active_position_count >= order.position_limit
-                ):
-                    order.status = OrderStatus.CANCELED
-                    order.message = "组合已达到批量订单的持仓标的上限"
-                    continue
-                quantity = self._affordable_buy_quantity(
-                    asset, requested, price, session
-                )
-                if quantity <= 0:
-                    if order.cash_adaptive:
-                        order.status = OrderStatus.CANCELED
-                        order.message = "D+1实际现金不足以完成最小交易单位，目标单取消"
-                    else:
-                        order.reject(
-                            RejectReason.INSUFFICIENT_CASH,
-                            "可用现金不足以完成最小交易单位",
-                        )
-                    continue
-                fees = self.fee_model.calculate(
-                    asset, quantity * price, is_sell=False, session=session
-                )
-                transaction = Transaction(
-                    order_id=order.id,
-                    asset=asset,
-                    amount=quantity,
-                    price=price,
-                    session=session,
-                    fees=fees,
-                )
+            transaction = Transaction(
+                order_id=order.id,
+                asset=asset,
+                amount=matched.amount,
+                price=matched.price,
+                session=session,
+                fees=matched.fees,
+            )
+            if transaction.amount > 0:
                 if settle_session is None:
                     try:
                         settle_session = self.calendar.next_session(session)
@@ -296,29 +288,6 @@ class SimulationBroker:
                 if opens_new_position:
                     active_position_count += 1
             else:
-                quantity = requested
-                if position is None or position_amount + _EPSILON < quantity:
-                    order.reject(
-                        RejectReason.INSUFFICIENT_POSITION, "持仓数量不足，禁止卖空"
-                    )
-                    continue
-                sellable = position.sellable_amount(session)
-                if sellable + _EPSILON < quantity:
-                    order.reject(
-                        RejectReason.T_PLUS_ONE, "可卖数量不足，证券尚未完成 T+1 交收"
-                    )
-                    continue
-                fees = self.fee_model.calculate(
-                    asset, quantity * price, is_sell=True, session=session
-                )
-                transaction = Transaction(
-                    order_id=order.id,
-                    asset=asset,
-                    amount=-quantity,
-                    price=price,
-                    session=session,
-                    fees=fees,
-                )
                 self._apply_sell(transaction)
                 if asset not in self.portfolio.positions:
                     active_position_count = max(0, active_position_count - 1)
@@ -331,11 +300,11 @@ class SimulationBroker:
             order.average_price = transaction.price
             order.status = (
                 OrderStatus.FILLED
-                if abs(abs(transaction.amount) - requested) <= _EPSILON
+                if abs(abs(transaction.amount) - abs(order.amount)) <= _EPSILON
                 else OrderStatus.PARTIALLY_FILLED
             )
             if order.status is OrderStatus.PARTIALLY_FILLED:
-                order.message = "受可用现金限制，订单按有效交易单位部分成交"
+                order.message = "受限定金额或可用现金约束，订单按有效交易单位部分成交"
             fills.append(transaction)
         for order in eligible:
             if not order.open:

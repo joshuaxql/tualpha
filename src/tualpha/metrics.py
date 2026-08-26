@@ -87,7 +87,6 @@ def calculate_metrics(
         "final_value": float(portfolio.iloc[-1]),
         "total_commission": float(performance["commission"].sum()),
         "total_stamp_tax": float(performance["stamp_tax"].sum()),
-        "total_handling_fee": float(performance["handling_fee"].sum()),
         "total_transfer_fee": float(performance["transfer_fee"].sum()),
         "total_fees": float(performance["fees"].sum()),
         "turnover": float(performance["turnover"].sum()),

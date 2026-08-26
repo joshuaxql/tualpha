@@ -1,4 +1,4 @@
-"""Incremental Tushare download and bundle publication workflow."""
+"""Tushare download to partitioned CSV and atomic Parquet publication."""
 
 from __future__ import annotations
 
@@ -18,21 +18,27 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from filelock import FileLock
+from tqdm.auto import tqdm
 
-from ._calendar_store import normalize_trade_calendar
-from ._hdf5_store import load_assets_manifest
-from .bundle import (
-    BUNDLE_NAME,
-    build_bundle,
-    paths_overlap,
-    update_status_path,
-    validate_bundle_name,
+# Avoid tqdm's monitor thread during long native DuckDB/Parquet operations on Windows.
+tqdm.monitor_interval = 0
+
+from ...config import DEFAULT_BUNDLE_ROOT
+from ...exceptions import ConfigurationError, DataError
+from ..tushare_fields import FINANCIAL_FIELDS
+from .calendar_store import normalize_trade_calendar
+from .csv_cache import CSV_CACHE_PROTOCOL, CsvUpdateWriter
+from .manager import BUNDLE_NAME, update_status_path, validate_bundle_name
+from .parquet_schema import INDEX_DAILY_CODES
+from .parquet_store import load_manifest, sha256_file
+from .parquet_writer import (
+    active_index_weight_state,
+    active_trade_dates,
+    build_parquet_bundle,
+    find_active_bundle,
 )
-from .config import DEFAULT_BUNDLE_ROOT
-from .exceptions import ConfigurationError, DataError
-from .tushare_fields import FINANCIAL_FIELDS
 
-UPDATE_SCHEMA_VERSION = 3
+UPDATE_SCHEMA_VERSION = 6
 INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION = 1
 DEFAULT_INDEX_WEIGHT_CODES = (
     "000300.SH",
@@ -75,6 +81,68 @@ EMPTY_COLUMNS = {
     "suspend_d": ["ts_code", "trade_date", "suspend_timing", "suspend_type"],
     "stock_st": ["ts_code", "name", "trade_date", "type", "type_name"],
 }
+STOCK_BASIC_FIELDS = (
+    "ts_code",
+    "name",
+    "market",
+    "exchange",
+    "list_status",
+    "list_date",
+    "delist_date",
+)
+ETF_BASIC_FIELDS = (
+    "ts_code",
+    "csname",
+    "extname",
+    "cname",
+    "index_code",
+    "index_name",
+    "setup_date",
+    "list_date",
+    "list_status",
+    "exchange",
+    "mgr_name",
+    "custod_name",
+    "mgt_fee",
+    "etf_type",
+)
+INDEX_BASIC_FIELDS = (
+    "ts_code",
+    "name",
+    "fullname",
+    "market",
+    "publisher",
+    "index_type",
+    "category",
+    "base_date",
+    "base_point",
+    "list_date",
+    "weight_rule",
+    "desc",
+    "exp_date",
+)
+INDEX_BASIC_MARKETS = ("MSCI", "CSI", "SSE", "SZSE", "CICC", "SW", "OTH")
+
+
+def _concat_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate API pages without pandas' empty/all-NA dtype ambiguity."""
+    columns = list(
+        dict.fromkeys(column for frame in frames for column in frame.columns)
+    )
+    populated: list[pd.DataFrame] = []
+    for frame in frames:
+        if frame.empty:
+            continue
+        useful_columns = frame.columns[~frame.isna().all(axis=0)]
+        if len(useful_columns):
+            populated.append(frame.loc[:, useful_columns])
+    if not populated:
+        return pd.DataFrame(columns=columns)
+    if len(populated) == 1:
+        result = populated[0].reset_index(drop=True)
+    else:
+        result = pd.concat(populated, ignore_index=True, sort=False)
+    return result.reindex(columns=columns)
 
 
 class ProClient(Protocol):
@@ -97,7 +165,6 @@ class TushareProClient:
 
 @dataclass(slots=True)
 class UpdateOptions:
-    csv_dir: Path
     bundle_root: Path = DEFAULT_BUNDLE_ROOT
     bundle_name: str = BUNDLE_NAME
     start: str | None = None
@@ -107,20 +174,21 @@ class UpdateOptions:
     retries: int = 3
     backoff: float = 2.0
     dry_run: bool = False
+    full: bool = False
+    compact: bool = False
     show_progress: bool = False
     index_weight_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        self.csv_dir = Path(self.csv_dir)
         self.bundle_root = Path(self.bundle_root).expanduser()
         try:
             validate_bundle_name(self.bundle_name)
         except DataError as exc:
             raise ConfigurationError(str(exc)) from exc
-        if paths_overlap(self.csv_dir, self.bundle_root):
-            raise ConfigurationError("csv_dir and bundle_root must not overlap")
         if self.lookback < 0:
             raise ConfigurationError("lookback must be non-negative")
+        if self.full and self.repair_from is not None:
+            raise ConfigurationError("full and repair_from cannot be used together")
         if self.retries < 1:
             raise ConfigurationError("retries must be at least 1")
         if self.backoff < 0:
@@ -148,8 +216,23 @@ class UpdateResult:
     dry_run: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ResumableRun:
+    run_id: str
+    started_at: str
+    staging: Path
+
+
+@dataclass(frozen=True, slots=True)
+class MasterData:
+    stock: pd.DataFrame
+    etf: pd.DataFrame
+    index: pd.DataFrame
+    trade_cal: pd.DataFrame
+
+
 class DataUpdater:
-    """Download all maintained datasets, then replace the current bundle."""
+    """Download maintained datasets into temporary CSV and publish a Bundle."""
 
     def __init__(
         self,
@@ -181,7 +264,8 @@ class DataUpdater:
                 if attempt + 1 < self.options.retries:
                     time.sleep(self.options.backoff * (2**attempt))
         raise DataError(
-            f"Tushare API {api_name!r} failed after {self.options.retries} attempts: {error}"
+            f"Tushare API {api_name!r} failed after {self.options.retries} "
+            f"attempts: {error}"
         ) from error
 
     def _fetch_paginated(
@@ -198,15 +282,19 @@ class DataUpdater:
             if frame.empty:
                 break
             frame = frame.copy()
-            fingerprint = hashlib.sha256(
-                frame.to_csv(index=False).encode("utf-8")
-            ).hexdigest()
+            row_hashes = pd.util.hash_pandas_object(
+                frame, index=True, categorize=True
+            ).to_numpy(dtype="<u8")
+            fingerprint = hashlib.sha256()
+            fingerprint.update(json.dumps(list(frame.columns)).encode("utf-8"))
+            fingerprint.update(row_hashes.tobytes())
+            digest = fingerprint.hexdigest()
             if len(frame) >= page_size:
-                if fingerprint in seen_full_pages:
+                if digest in seen_full_pages:
                     raise DataError(
                         f"{api_name} ignored pagination; repeated a full page"
                     )
-                seen_full_pages.add(fingerprint)
+                seen_full_pages.add(digest)
             pages.append(frame)
             if len(frame) < page_size:
                 break
@@ -214,7 +302,7 @@ class DataUpdater:
             raise DataError(f"{api_name} exceeded 1000 pagination requests")
         if not pages:
             return pd.DataFrame()
-        return pd.concat(pages, ignore_index=True, sort=False)
+        return _concat_frames(pages)
 
     @staticmethod
     def _normalize_frame(
@@ -235,60 +323,76 @@ class DataUpdater:
             frame = frame.sort_values(list(key_columns), kind="stable")
         return frame.reset_index(drop=True)
 
-    @staticmethod
-    def _stage_csv(frame: pd.DataFrame, path: Path) -> dict[str, Any]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(path, index=False, encoding="utf-8")
-        content = path.read_bytes()
-        return {
-            "path": str(path),
-            "rows": len(frame),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        }
-
     def _refresh_masters(
-        self, staging: Path
-    ) -> tuple[pd.DataFrame, list[tuple[Path, Path]], list[dict[str, Any]]]:
-        publications: list[tuple[Path, Path]] = []
-        journal: list[dict[str, Any]] = []
-
-        stock_pages = [
-            self._fetch_paginated("stock_basic", {"list_status": status}, 6000)
-            for status in ("L", "D", "P", "G")
-        ]
-        stock = self._normalize_frame(
-            pd.concat(stock_pages, ignore_index=True, sort=False), ["ts_code"]
-        )
+        self,
+        active_sessions: pd.DatetimeIndex,
+        writer: CsvUpdateWriter | None = None,
+    ) -> MasterData:
+        stock_pages: list[pd.DataFrame] = []
+        for status in ("L", "D", "P", "G"):
+            partition = f"masters/stock_basic/{status}"
+            if writer is not None and writer.has_partition(partition):
+                frame = writer.read_raw_partition(partition)
+            else:
+                frame = self._fetch_paginated(
+                    "stock_basic",
+                    {
+                        "list_status": status,
+                        "fields": ",".join(STOCK_BASIC_FIELDS),
+                    },
+                    6000,
+                ).reindex(columns=STOCK_BASIC_FIELDS)
+                if writer is not None:
+                    writer.write_raw_partition(partition, frame)
+            stock_pages.append(frame)
+        stock = self._normalize_frame(_concat_frames(stock_pages), ["ts_code"])
         if stock.empty:
             raise DataError("stock_basic returned no assets")
-        etf_pages = [
-            self._fetch_paginated("etf_basic", {"list_status": status}, 5000)
-            for status in ("L", "D", "P")
-        ]
-        etf = self._normalize_frame(
-            pd.concat(etf_pages, ignore_index=True, sort=False), ["ts_code"]
-        )
+        etf_pages: list[pd.DataFrame] = []
+        for status in ("L", "D", "P"):
+            partition = f"masters/etf_basic/{status}"
+            if writer is not None and writer.has_partition(partition):
+                frame = writer.read_raw_partition(partition)
+            else:
+                frame = self._fetch_paginated(
+                    "etf_basic",
+                    {
+                        "list_status": status,
+                        "fields": ",".join(ETF_BASIC_FIELDS),
+                    },
+                    5000,
+                ).reindex(columns=ETF_BASIC_FIELDS)
+                if writer is not None:
+                    writer.write_raw_partition(partition, frame)
+            etf_pages.append(frame)
+        etf = self._normalize_frame(_concat_frames(etf_pages), ["ts_code"])
         if etf.empty:
             raise DataError("etf_basic returned no assets")
-        index_pages = [
-            self._fetch_paginated("index_basic", {"market": market}, 5000)
-            for market in ("SSE", "SZSE", "CSI")
-        ]
-        index_basic = pd.concat(index_pages, ignore_index=True, sort=False)
-        existing_index_path = self.options.csv_dir / "index_basic.csv"
-        if existing_index_path.is_file():
-            existing_index = pd.read_csv(
-                existing_index_path, dtype=str, keep_default_na=False
-            )
-            index_basic = pd.concat(
-                [existing_index, index_basic], ignore_index=True, sort=False
-            )
-        index_basic = self._normalize_frame(index_basic, ["ts_code"])
-        if index_basic.empty:
+
+        index_pages: list[pd.DataFrame] = []
+        for market in INDEX_BASIC_MARKETS:
+            partition = f"masters/index_basic/{market}"
+            if writer is not None and writer.has_partition(partition):
+                frame = writer.read_raw_partition(partition)
+            else:
+                frame = self._fetch_paginated(
+                    "index_basic",
+                    {"market": market, "fields": ",".join(INDEX_BASIC_FIELDS)},
+                    8000,
+                ).reindex(columns=INDEX_BASIC_FIELDS)
+                if writer is not None:
+                    writer.write_raw_partition(partition, frame)
+            index_pages.append(frame)
+        index = self._normalize_frame(_concat_frames(index_pages), ["ts_code"])
+        if index.empty:
             raise DataError("index_basic returned no indices")
 
         today = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
         requested_starts = [today - pd.DateOffset(years=1)]
+        if len(active_sessions):
+            requested_starts.append(
+                active_sessions[0] if self.options.full else active_sessions[-1]
+            )
         for value in (self.options.start, self.options.repair_from):
             if value:
                 requested_starts.append(pd.Timestamp(value))
@@ -297,35 +401,23 @@ class DataUpdater:
             today + pd.DateOffset(years=2),
             pd.Timestamp(self.options.end) if self.options.end else today,
         )
-        calendar_update = self._fetch_paginated(
-            "trade_cal",
-            {
-                "exchange": "SSE",
-                "start_date": calendar_start.strftime("%Y%m%d"),
-                "end_date": calendar_end.strftime("%Y%m%d"),
-            },
-            5000,
-        )
-        existing_calendar_path = self.options.csv_dir / "trade_cal.csv"
-        if existing_calendar_path.is_file():
-            existing_calendar = pd.read_csv(
-                existing_calendar_path, dtype=str, keep_default_na=False
+        calendar_partition = "masters/trade_cal/SSE"
+        if writer is not None and writer.has_partition(calendar_partition):
+            calendar_update = writer.read_raw_partition(calendar_partition)
+        else:
+            calendar_update = self._fetch_paginated(
+                "trade_cal",
+                {
+                    "exchange": "SSE",
+                    "start_date": calendar_start.strftime("%Y%m%d"),
+                    "end_date": calendar_end.strftime("%Y%m%d"),
+                },
+                5000,
             )
-            calendar_update = pd.concat(
-                [existing_calendar, calendar_update], ignore_index=True, sort=False
-            )
+            if writer is not None:
+                writer.write_raw_partition(calendar_partition, calendar_update)
         trade_cal = normalize_trade_calendar(calendar_update)
-
-        for filename, frame in (
-            ("stock_basic.csv", stock),
-            ("etf_basic.csv", etf),
-            ("index_basic.csv", index_basic),
-            ("trade_cal.csv", trade_cal),
-        ):
-            staged = staging / filename
-            journal.append(self._stage_csv(frame, staged))
-            publications.append((staged, self.options.csv_dir / filename))
-        return trade_cal, publications, journal
+        return MasterData(stock=stock, etf=etf, index=index, trade_cal=trade_cal)
 
     def _safe_end_date(self, trade_cal: pd.DataFrame) -> str:
         today = pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y%m%d")
@@ -346,7 +438,12 @@ class DataUpdater:
             raise DataError(f"no completed trading session on or before {requested}")
         return candidates[-1]
 
-    def _target_dates(self, trade_cal: pd.DataFrame, safe_end: str) -> list[str]:
+    def _target_dates(
+        self,
+        trade_cal: pd.DataFrame,
+        safe_end: str,
+        active_sessions: pd.DatetimeIndex,
+    ) -> list[str]:
         open_dates = sorted(
             {
                 str(value)
@@ -356,58 +453,72 @@ class DataUpdater:
                 if str(value) <= safe_end
             }
         )
-        explicit_range = bool(self.options.start or self.options.repair_from)
-        if self.options.start:
+        if not open_dates:
+            raise DataError("trade calendar has no target sessions")
+        if self.options.full:
+            if self.options.start:
+                start = self.options.start
+            elif len(active_sessions):
+                start = active_sessions[0].strftime("%Y%m%d")
+            else:
+                raise ConfigurationError(
+                    "a full build requires an explicit --from date"
+                )
+        elif self.options.start:
             start = self.options.start
         elif self.options.repair_from:
             start = self.options.repair_from
+        elif not len(active_sessions):
+            start = open_dates[0]
         else:
-            existing = sorted((self.options.csv_dir / "daily").glob("*.csv"))
-            last_existing = existing[-1].stem if existing else open_dates[0]
-            position = min(
-                max(0, len(open_dates) - self.options.lookback),
-                max(0, len(open_dates) - 1),
+            position = (
+                len(open_dates) - 1
+                if self.options.lookback == 0
+                else max(0, len(open_dates) - self.options.lookback)
             )
-            lookback_start = open_dates[position] if open_dates else last_existing
-            start = min(last_existing, lookback_start)
-        targets = {date for date in open_dates if start <= date <= safe_end}
-        if not explicit_range:
-            required_directories = {
-                *(spec.directory for spec in DAILY_DATASETS),
-                "industry",
-            }
-            targets.update(
-                date
-                for date in open_dates
-                if any(
-                    not (self.options.csv_dir / directory / f"{date}.csv").is_file()
-                    for directory in required_directories
-                )
-            )
-        return sorted(targets)
+            active_end = active_sessions[-1].strftime("%Y%m%d")
+            start = min(active_end, open_dates[position])
+        return [date for date in open_dates if start <= date <= safe_end]
 
     def _download_daily_partitions(
         self,
         dates: Sequence[str],
-        staging: Path,
-    ) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
-        publications: list[tuple[Path, Path]] = []
-        journal: list[dict[str, Any]] = []
-        current_industry = self._fetch_paginated(
-            "index_member_all", {"is_new": "Y"}, 2000
-        )
-        historical_industry = self._fetch_paginated(
-            "index_member_all", {"is_new": "N"}, 2000
-        )
-        industry = pd.concat(
-            [current_industry, historical_industry], ignore_index=True, sort=False
-        )
+        writer: CsvUpdateWriter,
+    ) -> None:
+        current_partition = "masters/industry/current"
+        if writer.has_partition(current_partition):
+            current_industry = writer.read_raw_partition(current_partition)
+        else:
+            current_industry = self._fetch_paginated(
+                "index_member_all", {"is_new": "Y"}, 2000
+            )
+            writer.write_raw_partition(current_partition, current_industry)
+        historical_partition = "masters/industry/historical"
+        if writer.has_partition(historical_partition):
+            historical_industry = writer.read_raw_partition(historical_partition)
+        else:
+            historical_industry = self._fetch_paginated(
+                "index_member_all", {"is_new": "N"}, 2000
+            )
+            writer.write_raw_partition(historical_partition, historical_industry)
+        industry = _concat_frames([current_industry, historical_industry])
         industry = self._normalize_frame(industry, ["ts_code", "in_date", "out_date"])
         if dates and industry.empty:
             raise DataError("index_member_all returned no industry members")
 
-        for date in dates:
+        for date in tqdm(
+            dates,
+            desc="下载日频数据",
+            unit="交易日",
+            dynamic_ncols=True,
+            leave=False,
+            position=1,
+            disable=not self.options.show_progress,
+        ):
             for spec in DAILY_DATASETS:
+                partition = f"daily/{spec.directory}/{date}"
+                if writer.has_partition(partition):
+                    continue
                 frame = self._fetch_paginated(
                     spec.api_name, {"trade_date": date}, spec.page_size
                 )
@@ -424,161 +535,149 @@ class DataUpdater:
                     returned_dates = set(frame["trade_date"].astype(str))
                     if returned_dates != {date}:
                         raise DataError(
-                            f"{spec.api_name} returned unexpected dates: {returned_dates}"
+                            f"{spec.api_name} returned unexpected dates: "
+                            f"{returned_dates}"
                         )
-                staged = staging / spec.directory / f"{date}.csv"
-                entry = self._stage_csv(frame, staged)
-                entry.update({"dataset": spec.directory, "trade_date": date})
-                journal.append(entry)
-                publications.append(
-                    (staged, self.options.csv_dir / spec.directory / f"{date}.csv")
-                )
-
-            industry_destination = self.options.csv_dir / "industry" / f"{date}.csv"
-            if not industry_destination.exists() or self.options.repair_from:
-                point_in_time = industry.copy()
-                point_in_time["in_date"] = (
-                    point_in_time["in_date"].fillna("").astype(str)
-                )
-                point_in_time["out_date"] = (
-                    point_in_time["out_date"].fillna("").astype(str)
-                )
-                point_in_time = point_in_time[
-                    (
-                        (point_in_time["in_date"] == "")
-                        | (point_in_time["in_date"] <= date)
-                    )
-                    & (
-                        (point_in_time["out_date"] == "")
-                        | (point_in_time["out_date"] > date)
-                    )
-                ]
-                point_in_time = point_in_time.sort_values("in_date", kind="stable")
-                point_in_time = point_in_time.drop_duplicates("ts_code", keep="last")
-                industry_day = point_in_time[
-                    [
-                        "ts_code",
-                        "l1_code",
-                        "l1_name",
-                        "l2_code",
-                        "l2_name",
-                        "l3_code",
-                        "l3_name",
+                if spec.directory == "daily":
+                    writer.append_daily(frame, "stock", partition=partition)
+                elif spec.directory == "fund_daily":
+                    writer.append_daily(frame, "etf", partition=partition)
+                elif spec.directory == "index_daily":
+                    frame = frame[
+                        frame["ts_code"].astype(str).str.upper().isin(INDEX_DAILY_CODES)
                     ]
-                ].copy()
-                industry_day.insert(1, "trade_date", date)
-                industry_day = self._normalize_frame(
-                    industry_day, ["ts_code", "trade_date"]
+                    writer.append_daily(frame, "index", partition=partition)
+                elif spec.directory in {"adj_factor", "fund_adj"}:
+                    writer.append_daily_role("adj_factor", frame, partition=partition)
+                else:
+                    writer.append_daily_role(spec.directory, frame, partition=partition)
+
+            industry_partition = f"daily/industry/{date}"
+            if writer.has_partition(industry_partition):
+                continue
+            point_in_time = industry.copy()
+            point_in_time["in_date"] = point_in_time["in_date"].fillna("").astype(str)
+            point_in_time["out_date"] = point_in_time["out_date"].fillna("").astype(str)
+            point_in_time = point_in_time[
+                ((point_in_time["in_date"] == "") | (point_in_time["in_date"] <= date))
+                & (
+                    (point_in_time["out_date"] == "")
+                    | (point_in_time["out_date"] > date)
                 )
-                staged = staging / "industry" / f"{date}.csv"
-                journal.append(self._stage_csv(industry_day, staged))
-                publications.append((staged, industry_destination))
-        return publications, journal
+            ]
+            point_in_time = point_in_time.sort_values("in_date", kind="stable")
+            point_in_time = point_in_time.drop_duplicates("ts_code", keep="last")
+            required = [
+                "ts_code",
+                "l1_code",
+                "l1_name",
+                "l2_code",
+                "l2_name",
+                "l3_code",
+                "l3_name",
+            ]
+            missing = set(required).difference(point_in_time.columns)
+            if missing:
+                raise DataError(
+                    f"index_member_all is missing industry fields: {sorted(missing)}"
+                )
+            industry_day = point_in_time[required].copy()
+            industry_day.insert(1, "trade_date", date)
+            industry_day = self._normalize_frame(
+                industry_day, ["ts_code", "trade_date"]
+            )
+            writer.append_daily_role(
+                "industry",
+                industry_day,
+                partition=industry_partition,
+            )
 
     @staticmethod
-    def _recent_quarter_ends(today: pd.Timestamp, count: int = 8) -> list[str]:
-        period = today.to_period("Q")
-        if period.end_time.normalize() > today:
+    def _recent_quarter_ends(end: pd.Timestamp, count: int = 8) -> list[str]:
+        period = end.to_period("Q")
+        if period.end_time.normalize() > end:
             period -= 1
         return [
             (period - offset).end_time.normalize().strftime("%Y%m%d")
             for offset in reversed(range(count))
         ]
 
-    def _financial_revision_start(self, directory: str, safe_end: str) -> str:
-        latest: pd.Timestamp | None = None
-        for path in (self.options.csv_dir / directory).glob("*.csv"):
-            try:
-                frame = pd.read_csv(
-                    path,
-                    dtype=str,
-                    usecols=lambda column: column in {"ann_date", "f_ann_date"},
-                )
-            except (ValueError, pd.errors.EmptyDataError):
-                continue
-            for column in ("ann_date", "f_ann_date"):
-                if column not in frame:
-                    continue
-                values = pd.to_datetime(
-                    frame[column], format="%Y%m%d", errors="coerce"
-                ).dropna()
-                if not values.empty:
-                    candidate = values.max()
-                    latest = candidate if latest is None else max(latest, candidate)
+    @classmethod
+    def _full_financial_periods(cls, start: str, safe_end: str) -> set[str]:
+        first = pd.to_datetime(start, format="%Y%m%d") - pd.DateOffset(years=2)
         end = pd.to_datetime(safe_end, format="%Y%m%d")
-        start = (
-            end - pd.DateOffset(years=2)
-            if latest is None
-            else latest - pd.Timedelta(days=30)
-        )
-        return min(start, end).strftime("%Y%m%d")
+        last_completed = cls._recent_quarter_ends(end, count=1)[0]
+        return {
+            period.end_time.normalize().strftime("%Y%m%d")
+            for period in pd.period_range(
+                first.to_period("Q"),
+                pd.Timestamp(last_completed).to_period("Q"),
+                freq="Q",
+            )
+        }
+
+    @staticmethod
+    def _incremental_financial_periods(safe_end: str) -> list[str]:
+        """Return report periods expected to be publishing on the update date."""
+
+        end = pd.to_datetime(safe_end, format="%Y%m%d")
+        year = end.year
+        month_day = (end.month, end.day)
+        annual = f"{year - 1}1231"
+        if (1, 1) <= month_day < (4, 1):
+            return [annual]
+        if (4, 1) <= month_day <= (4, 30):
+            return [annual, f"{year}0331"]
+        if (7, 1) <= month_day <= (8, 31):
+            return [f"{year}0630"]
+        if (10, 1) <= month_day <= (10, 31):
+            return [f"{year}0930"]
+        return []
 
     def _download_financials(
-        self, staging: Path, safe_end: str
-    ) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
-        publications: list[tuple[Path, Path]] = []
-        journal: list[dict[str, Any]] = []
-        recent_periods = set(
-            self._recent_quarter_ends(
-                pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).normalize()
-            )
-        )
-
-        for directory, api_name in FINANCIAL_DATASETS.items():
-            existing = sorted((self.options.csv_dir / directory).glob("*.csv"))
-            periods = recent_periods | {path.stem for path in existing[-8:]}
-            expected_fields = set(FINANCIAL_FIELDS[directory])
-            for path in existing:
-                try:
-                    columns = set(pd.read_csv(path, nrows=0).columns)
-                except pd.errors.EmptyDataError:
-                    columns = set()
-                if not expected_fields.issubset(columns):
-                    periods.add(path.stem)
-            if directory == "fina_indicator":
-                # This endpoint's start/end dates refer to report periods, not
-                # announcement dates, so all known periods must be refreshed
-                # to discover old-period revisions.
-                periods.update(path.stem for path in existing)
-
-            fields = ",".join(FINANCIAL_FIELDS[directory])
-            fetched_by_period: dict[str, list[pd.DataFrame]] = {}
-            for period in sorted(periods):
-                frame = self._fetch_paginated(
-                    api_name, {"period": period, "fields": fields}, 5000
-                )
-                if not frame.empty:
-                    fetched_by_period.setdefault(period, []).append(frame)
-            revisions = (
-                pd.DataFrame()
-                if directory == "fina_indicator"
-                else self._fetch_paginated(
+        self,
+        writer: CsvUpdateWriter,
+        safe_end: str,
+        full_start: str | None,
+    ) -> None:
+        if full_start is not None:
+            periods = sorted(self._full_financial_periods(full_start, safe_end))
+            requests = [
+                (directory, api_name, {"period": period}, period)
+                for directory, api_name in FINANCIAL_DATASETS.items()
+                for period in periods
+            ]
+        else:
+            announcement_start = (
+                pd.to_datetime(safe_end, format="%Y%m%d") - pd.DateOffset(days=120)
+            ).strftime("%Y%m%d")
+            requests = [
+                (
+                    directory,
                     api_name,
-                    {
-                        "start_date": self._financial_revision_start(
-                            directory, safe_end
-                        ),
-                        "end_date": safe_end,
-                        "fields": fields,
-                    },
-                    5000,
+                    {"start_date": announcement_start, "end_date": safe_end},
+                    f"ann-{announcement_start}-{safe_end}",
                 )
-            )
-            if not revisions.empty:
-                if "end_date" not in revisions:
-                    raise DataError(f"{api_name} revisions are missing end_date")
-                for period, frame in revisions.groupby("end_date"):
-                    fetched_by_period.setdefault(str(period), []).append(frame)
-
-            for period, frames in sorted(fetched_by_period.items()):
-                destination = self.options.csv_dir / directory / f"{period}.csv"
-                if destination.is_file():
-                    frames.insert(
-                        0,
-                        pd.read_csv(destination, dtype=str, keep_default_na=False),
-                    )
-                frame = pd.concat(frames, ignore_index=True, sort=False)
-                key_columns = [
+                for directory, api_name in FINANCIAL_DATASETS.items()
+            ]
+        datasets = tqdm(
+            requests,
+            total=len(requests),
+            desc="下载财务数据",
+            unit="请求",
+            dynamic_ncols=True,
+            leave=False,
+            position=1,
+            disable=not self.options.show_progress,
+        )
+        for directory, api_name, params, label in datasets:
+            partition = f"finance/{directory}/{label}"
+            if writer.has_partition(partition):
+                continue
+            fields = ",".join(FINANCIAL_FIELDS[directory])
+            frame = self._fetch_paginated(api_name, {**params, "fields": fields}, 5000)
+            if not frame.empty:
+                keys = [
                     column
                     for column in (
                         "ts_code",
@@ -592,63 +691,28 @@ class DataUpdater:
                     )
                     if column in frame.columns
                 ]
-                frame = self._normalize_frame(frame, key_columns)
-                staged = staging / directory / f"{period}.csv"
-                entry = self._stage_csv(frame, staged)
-                entry.update({"dataset": directory, "period": period})
-                journal.append(entry)
-                publications.append((staged, destination))
-        return publications, journal
-
-    def _index_weight_history_start(self, dates: Sequence[str], safe_end: str) -> str:
-        candidates = [str(date) for date in dates]
-        for directory in ("daily", "fund_daily", "index_daily"):
-            candidates.extend(
-                path.stem
-                for path in (self.options.csv_dir / directory).glob("*.csv")
-                if len(path.stem) == 8 and path.stem.isdigit()
+                frame = self._normalize_frame(frame, keys)
+            writer.append_finance(
+                directory,
+                frame,
+                partition=partition,
             )
+
+    def _index_weight_history_start(
+        self,
+        dates: Sequence[str],
+        safe_end: str,
+        active_sessions: pd.DatetimeIndex,
+    ) -> str:
+        candidates = [str(date) for date in dates]
+        if self.options.full and len(active_sessions):
+            candidates.append(active_sessions[0].strftime("%Y%m%d"))
         earliest = min(candidates) if candidates else safe_end
         return (
             (pd.to_datetime(earliest, format="%Y%m%d") - pd.DateOffset(months=1))
             .replace(day=1)
             .strftime("%Y%m%d")
         )
-
-    def _load_index_weight_coverage(self) -> dict[str, Any]:
-        path = self.options.csv_dir / "index_weight" / "_coverage.json"
-        if not path.is_file():
-            return {
-                "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
-                "codes": {},
-            }
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise DataError(f"invalid index weight coverage file: {path}") from exc
-        if payload.get(
-            "schema_version"
-        ) != INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION or not isinstance(
-            payload.get("codes"), dict
-        ):
-            raise DataError(f"unsupported index weight coverage file: {path}")
-        return payload
-
-    def _existing_index_weight_dates(self) -> dict[str, set[str]]:
-        result: dict[str, set[str]] = {}
-        for path in (self.options.csv_dir / "index_weight").glob("*.csv"):
-            try:
-                frame = pd.read_csv(
-                    path,
-                    usecols=["index_code", "trade_date"],
-                    dtype=str,
-                    keep_default_na=False,
-                )
-            except (ValueError, pd.errors.EmptyDataError):
-                continue
-            for code, values in frame.groupby("index_code")["trade_date"]:
-                result.setdefault(str(code).upper(), set()).update(values.astype(str))
-        return result
 
     @staticmethod
     def _normalize_index_weight_frame(
@@ -693,22 +757,44 @@ class DataUpdater:
 
     def _download_index_weights(
         self,
-        staging: Path,
+        writer: CsvUpdateWriter,
         safe_end: str,
         dates: Sequence[str],
-    ) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
-        existing_dates = self._existing_index_weight_dates()
+        active_sessions: pd.DatetimeIndex,
+    ) -> None:
+        if self.options.full:
+            existing_dates, coverage = {}, {}
+        else:
+            existing_dates, coverage = active_index_weight_state(
+                self.options.bundle_root, self.options.bundle_name
+            )
         codes = {
             *DEFAULT_INDEX_WEIGHT_CODES,
             *(code.upper() for code in self.options.index_weight_codes),
             *existing_dates,
         }
-        history_start = self._index_weight_history_start(dates, safe_end)
-        coverage = self._load_index_weight_coverage()
-        coverage_codes = coverage["codes"]
-        fetched: list[pd.DataFrame] = []
+        history_start = self._index_weight_history_start(
+            dates, safe_end, active_sessions
+        )
+        if coverage.get("schema_version") != INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION:
+            coverage = {
+                "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
+                "codes": {},
+            }
+        coverage_codes = coverage.setdefault("codes", {})
+        if not isinstance(coverage_codes, dict):
+            raise DataError("active index_weight coverage is invalid")
 
-        for code in sorted(codes):
+        index_codes = tqdm(
+            sorted(codes),
+            desc="下载指数权重",
+            unit="指数",
+            dynamic_ncols=True,
+            leave=False,
+            position=1,
+            disable=not self.options.show_progress,
+        )
+        for code in index_codes:
             known_dates = existing_dates.get(code, set())
             covered = coverage_codes.get(code)
             if (
@@ -726,8 +812,15 @@ class DataUpdater:
             if self.options.repair_from is not None:
                 start = max(history_start, min(start, self.options.repair_from))
             start = min(start, safe_end)
-            code_frames: list[pd.DataFrame] = []
             for range_start, range_end in self._index_weight_ranges(start, safe_end):
+                partition = f"index_weight/{code}/{range_start[:4]}"
+                if writer.has_partition(partition):
+                    cached = writer.read_partition(partition)
+                    if not cached.empty:
+                        existing_dates.setdefault(code, set()).update(
+                            cached["snapshot_date"].astype(str)
+                        )
+                    continue
                 frame = self._fetch_paginated(
                     "index_weight",
                     {
@@ -737,21 +830,25 @@ class DataUpdater:
                     },
                     5000,
                 )
-                if not frame.empty:
-                    code_frames.append(
-                        self._normalize_index_weight_frame(
-                            frame, code, range_start, range_end
-                        )
+                normalized = (
+                    self._normalize_index_weight_frame(
+                        frame, code, range_start, range_end
                     )
-            if code_frames:
-                normalized = self._normalize_frame(
-                    pd.concat(code_frames, ignore_index=True, sort=False),
-                    ["index_code", "con_code", "trade_date"],
+                    if not frame.empty
+                    else pd.DataFrame(
+                        columns=[
+                            "index_code",
+                            "con_code",
+                            "trade_date",
+                            "weight",
+                        ]
+                    )
                 )
-                fetched.append(normalized)
-                existing_dates.setdefault(code, set()).update(
-                    normalized["trade_date"].astype(str)
-                )
+                writer.append_index_weights(normalized, partition=partition)
+                if not normalized.empty:
+                    existing_dates.setdefault(code, set()).update(
+                        normalized["trade_date"].astype(str)
+                    )
             previous_from = (
                 str(covered.get("from"))
                 if isinstance(covered, dict) and covered.get("from")
@@ -770,184 +867,88 @@ class DataUpdater:
                 "index_weight returned no historical snapshots for default indices: "
                 f"{missing_defaults}"
             )
-
-        publications: list[tuple[Path, Path]] = []
-        journal: list[dict[str, Any]] = []
-        combined = (
-            pd.concat(fetched, ignore_index=True, sort=False)
-            if fetched
-            else pd.DataFrame(
-                columns=["index_code", "con_code", "trade_date", "weight"]
-            )
-        )
-        for trade_date, frame in combined.groupby("trade_date"):
-            date = str(trade_date)
-            destination = self.options.csv_dir / "index_weight" / f"{date}.csv"
-            if destination.is_file():
-                try:
-                    existing = pd.read_csv(
-                        destination, dtype=str, keep_default_na=False
-                    )
-                except pd.errors.EmptyDataError:
-                    existing = pd.DataFrame(columns=frame.columns)
-                replaced_codes = set(frame["index_code"].astype(str))
-                if not existing.empty and "index_code" in existing:
-                    existing = existing[
-                        ~existing["index_code"]
-                        .astype(str)
-                        .str.upper()
-                        .isin(replaced_codes)
-                    ]
-                frame = pd.concat([existing, frame], ignore_index=True, sort=False)
-            frame = self._normalize_frame(
-                frame,
-                ["index_code", "con_code", "trade_date"],
-            )
-            staged = staging / "index_weight" / f"{date}.csv"
-            entry = self._stage_csv(frame, staged)
-            entry.update({"dataset": "index_weight", "snapshot_date": date})
-            journal.append(entry)
-            publications.append((staged, destination))
-
-        coverage_payload = {
-            "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
-            "codes": {code: coverage_codes[code] for code in sorted(coverage_codes)},
-        }
-        coverage_staged = staging / "index_weight" / "_coverage.json"
-        coverage_staged.parent.mkdir(parents=True, exist_ok=True)
-        coverage_staged.write_text(
-            json.dumps(coverage_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        content = coverage_staged.read_bytes()
-        journal.append(
+        writer.set_index_coverage(
             {
-                "path": str(coverage_staged),
-                "rows": len(coverage_payload["codes"]),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "dataset": "index_weight_coverage",
+                "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
+                "codes": {
+                    code: coverage_codes[code] for code in sorted(coverage_codes)
+                },
             }
         )
-        publications.append(
-            (
-                coverage_staged,
-                self.options.csv_dir / "index_weight" / "_coverage.json",
-            )
-        )
-        return publications, journal
 
-    @staticmethod
-    def _copy_replace(source: Path, destination: Path) -> None:
-        """Atomically replace a file even when source is on another volume."""
-
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.parent / (
-            f".{destination.name}.tualpha-{uuid4().hex}.tmp"
-        )
-        try:
-            shutil.copy2(source, temporary)
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    @classmethod
-    def _restore_files(cls, backups: Sequence[tuple[Path, Path, bool]]) -> None:
-        for destination, backup, existed in reversed(backups):
-            if existed and backup.exists():
-                cls._copy_replace(backup, destination)
-                backup.unlink(missing_ok=True)
-            else:
-                destination.unlink(missing_ok=True)
-
-    @classmethod
-    def _publish_files(
-        cls,
-        publications: Sequence[tuple[Path, Path]],
-        backup_root: Path,
-    ) -> list[tuple[Path, Path, bool]]:
-        backups: list[tuple[Path, Path, bool]] = []
-        backup_root.mkdir(parents=True, exist_ok=True)
-        manifest_path = backup_root / "manifest.json"
-        entries: list[dict[str, Any]] = []
-
-        def write_manifest() -> None:
-            temporary = manifest_path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            os.replace(temporary, manifest_path)
-
-        try:
-            for index, (staged, destination) in enumerate(publications):
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                backup = backup_root / f"{index:06d}.csv"
-                existed = destination.exists()
-                entry = {
-                    "staged": str(staged.resolve()),
-                    "destination": str(destination.resolve()),
-                    "backup": str(backup.resolve()),
-                    "existed": existed,
-                    "phase": "planned",
-                }
-                entries.append(entry)
-                write_manifest()
-                if existed:
-                    shutil.copy2(destination, backup)
-                backups.append((destination, backup, existed))
-                entry["phase"] = "backed_up"
-                write_manifest()
-                cls._copy_replace(staged, destination)
-                entry["phase"] = "published"
-                write_manifest()
-        except Exception:
-            cls._restore_files(backups)
-            raise
-        return backups
-
-    def _recover_interrupted_run(self) -> None:
+    def _recover_interrupted_run(self) -> ResumableRun | None:
         if not self.status_path.is_file():
-            return
+            return None
         try:
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return
-        if status.get("status") != "running":
-            return
-        if os.path.normcase(str(status.get("csv_dir", ""))) != os.path.normcase(
-            str(self.options.csv_dir.resolve())
+            return None
+        if status.get("operation") != "data_update" or status.get("status") not in {
+            "running",
+            "failed",
+        }:
+            return None
+        if (
+            os.path.normcase(str(status.get("bundle_root", "")))
+            != os.path.normcase(str(self.options.bundle_root.resolve()))
+            or str(status.get("bundle_name", "")) != self.options.bundle_name
         ):
-            return
+            return None
         staging_value = status.get("staging_path")
         if not staging_value:
-            return
+            return None
         staging = Path(str(staging_value))
-        manifest_path = staging / "backups" / "manifest.json"
+        active = find_active_bundle(self.options.bundle_root, self.options.bundle_name)
         committed = (staging / "BUNDLE_PUBLISHED").is_file()
-        if manifest_path.is_file() and not committed:
-            entries = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for entry in reversed(entries):
-                destination = Path(entry["destination"])
-                backup = Path(entry["backup"])
-                staged = Path(entry["staged"])
-                for temporary in destination.parent.glob(
-                    f".{destination.name}.tualpha-*.tmp"
-                ):
-                    temporary.unlink(missing_ok=True)
-                changed = (
-                    entry.get("phase") in {"backed_up", "published"}
-                    or backup.exists()
-                    or not staged.exists()
-                )
-                if not changed:
-                    continue
-                if bool(entry.get("existed")) and backup.exists():
-                    self._copy_replace(backup, destination)
-                    backup.unlink(missing_ok=True)
-                else:
-                    destination.unlink(missing_ok=True)
+        expected_path = staging / "EXPECTED_GENERATION"
+        if not committed and active is not None and expected_path.is_file():
+            expected_generation = expected_path.read_text(encoding="utf-8").strip()
+            committed = (
+                bool(expected_generation)
+                and load_manifest(active)["generation"] == expected_generation
+            )
+
+        signature_matches = all(
+            (
+                status.get("requested_start") == self.options.start,
+                status.get("requested_end") == self.options.end,
+                status.get("repair_from") == self.options.repair_from,
+                int(status.get("lookback", -1)) == self.options.lookback,
+                bool(status.get("dry_run")) == self.options.dry_run,
+                bool(status.get("full")) == self.options.full,
+                bool(status.get("compact")) == self.options.compact,
+                tuple(status.get("index_weight_codes", ()))
+                == self.options.index_weight_codes,
+            )
+        )
+        cache_manifest = staging / "cache" / "cache-manifest.json"
+        cache_is_resumable = False
+        if signature_matches and not committed and cache_manifest.is_file():
+            try:
+                cache_metadata = json.loads(cache_manifest.read_text(encoding="utf-8"))
+                started = pd.Timestamp(str(status.get("started_at")))
+                age = pd.Timestamp.now(tz="UTC") - started
+                cache_is_resumable = cache_metadata.get(
+                    "protocol"
+                ) == CSV_CACHE_PROTOCOL and age <= pd.Timedelta(hours=24)
+            except (TypeError, ValueError, OSError):
+                cache_is_resumable = False
+        if cache_is_resumable:
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "RECOVERED.txt").write_text(
+                "resuming partitioned CSV cache\n", encoding="utf-8"
+            )
+            return ResumableRun(
+                run_id=str(status["run_id"]),
+                started_at=str(status["started_at"]),
+                staging=staging,
+            )
+
+        if status.get("status") != "running":
+            return None
         staging.mkdir(parents=True, exist_ok=True)
         (staging / "RECOVERED.txt").write_text(
-            "bundle already published\n" if committed else "CSV files restored\n",
+            "bundle already published\n" if committed else "active Bundle unchanged\n",
             encoding="utf-8",
         )
         self._write_status(
@@ -961,12 +962,13 @@ class DataUpdater:
                     "message": (
                         "previous update was interrupted after Bundle publication"
                         if committed
-                        else "previous update was interrupted; CSV files restored"
+                        else "previous update was interrupted; active Bundle unchanged"
                     ),
                 },
                 "staging_path": str(staging),
             }
         )
+        return None
 
     def _write_status(self, payload: dict[str, Any]) -> None:
         previous: dict[str, Any] = {}
@@ -979,7 +981,6 @@ class DataUpdater:
             "schema_version": UPDATE_SCHEMA_VERSION,
             "operation": "data_update",
             "bundle_name": self.options.bundle_name,
-            "csv_dir": str(self.options.csv_dir.resolve()),
             "bundle_root": str(self.options.bundle_root.resolve()),
             **payload,
         }
@@ -994,17 +995,22 @@ class DataUpdater:
         os.replace(temporary, self.status_path)
 
     def run(self) -> UpdateResult:
-        self.options.csv_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self.state_dir / ".locks" / "update.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock = FileLock(str(lock_path))
         with lock:
-            self._recover_interrupted_run()
-            run_id = uuid4().hex
-            started_at = datetime.now(ZoneInfo("UTC")).isoformat()
-            staging = self.state_dir / ".staging" / "update" / run_id
-            staging.mkdir(parents=True, exist_ok=False)
+            resumable = self._recover_interrupted_run()
+            if resumable is None:
+                run_id = uuid4().hex
+                started_at = datetime.now(ZoneInfo("UTC")).isoformat()
+                staging = self.state_dir / ".staging" / "update" / run_id
+                staging.mkdir(parents=True, exist_ok=False)
+            else:
+                run_id = resumable.run_id
+                started_at = resumable.started_at
+                staging = resumable.staging
+                (staging / "FAILED.txt").unlink(missing_ok=True)
             run_metadata = {
                 "run_id": run_id,
                 "started_at": started_at,
@@ -1013,6 +1019,10 @@ class DataUpdater:
                 "repair_from": self.options.repair_from,
                 "lookback": self.options.lookback,
                 "dry_run": self.options.dry_run,
+                "full": self.options.full,
+                "compact": self.options.compact,
+                "index_weight_codes": list(self.options.index_weight_codes),
+                "resumed": resumable is not None,
             }
             self._write_status(
                 {
@@ -1022,40 +1032,102 @@ class DataUpdater:
                     "staging_path": str(staging),
                 }
             )
-            publications: list[tuple[Path, Path]] = []
-            journal: list[dict[str, Any]] = []
-            backups: list[tuple[Path, Path, bool]] = []
-            bundle_published = False
             dates: list[str] = []
+            bundle_published = False
+            phase = "download"
+            progress = tqdm(
+                total=5,
+                desc=("TuAlpha 全量构建" if self.options.full else "TuAlpha 数据更新"),
+                unit="阶段",
+                dynamic_ncols=True,
+                disable=not self.options.show_progress,
+            )
+            progress.set_postfix_str("刷新基础信息与交易日历", refresh=True)
             try:
-                trade_cal, master_files, master_journal = self._refresh_masters(staging)
-                publications.extend(master_files)
-                journal.extend(master_journal)
-                safe_end = self._safe_end_date(trade_cal)
-                dates = self._target_dates(trade_cal, safe_end)
-                daily_files, daily_journal = self._download_daily_partitions(
-                    dates, staging
+                active_sessions = active_trade_dates(
+                    self.options.bundle_root, self.options.bundle_name
                 )
-                publications.extend(daily_files)
-                journal.extend(daily_journal)
-                financial_files, financial_journal = self._download_financials(
-                    staging, safe_end
+                if (
+                    self.options.full
+                    and not self.options.start
+                    and not len(active_sessions)
+                ):
+                    raise ConfigurationError(
+                        "a full build requires an explicit --from date"
+                    )
+                full_start = (
+                    self.options.start
+                    or (
+                        active_sessions[0].strftime("%Y%m%d")
+                        if len(active_sessions)
+                        else None
+                    )
+                    if self.options.full
+                    else None
                 )
-                publications.extend(financial_files)
-                journal.extend(financial_journal)
-                weight_files, weight_journal = self._download_index_weights(
-                    staging, safe_end, dates
-                )
-                publications.extend(weight_files)
-                journal.extend(weight_journal)
+                cache_path = staging / "cache"
+                with CsvUpdateWriter(
+                    cache_path, resume=resumable is not None
+                ) as writer:
+                    masters = self._refresh_masters(active_sessions, writer)
+                    safe_end = self._safe_end_date(masters.trade_cal)
+                    dates = self._target_dates(
+                        masters.trade_cal, safe_end, active_sessions
+                    )
+                    if not dates:
+                        raise DataError("update request contains no open trading dates")
+                    writer.set_target_dates(dates)
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        f"下载 {len(dates)} 个交易日的日频数据", refresh=True
+                    )
+                    self._download_daily_partitions(dates, writer)
+                    progress.update(1)
+                    progress.set_postfix_str("下载 PIT 财务数据", refresh=True)
+                    financial_full_start = full_start or (
+                        dates[0] if not len(active_sessions) else None
+                    )
+                    self._download_financials(writer, safe_end, financial_full_start)
+                    progress.update(1)
+                    progress.set_postfix_str("下载 PIT 指数权重", refresh=True)
+                    self._download_index_weights(
+                        writer,
+                        safe_end,
+                        dates,
+                        (
+                            pd.DatetimeIndex([])
+                            if self.options.full
+                            else active_sessions
+                        ),
+                    )
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        "整理暂存数据"
+                        if self.options.dry_run
+                        else "构建、校验并发布 Bundle",
+                        refresh=True,
+                    )
+                    batch_count = writer.batch_count
                 (staging / "journal.json").write_text(
-                    json.dumps(journal, ensure_ascii=False, indent=2), encoding="utf-8"
+                    json.dumps(
+                        {
+                            "storage": "partitioned-csv-cache",
+                            "downloaded_batches": batch_count,
+                            "updated_dates": dates,
+                            "cache_manifest_sha256": sha256_file(
+                                cache_path / "cache-manifest.json"
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
                 )
                 if self.options.dry_run:
                     result = UpdateResult(
                         run_id=run_id,
                         updated_dates=tuple(dates),
-                        updated_files=len(publications),
+                        updated_files=0,
                         bundle_path=None,
                         dry_run=True,
                     )
@@ -1065,41 +1137,62 @@ class DataUpdater:
                             "phase": "download",
                             **run_metadata,
                             "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                            "downloaded_batches": batch_count,
                             "result": asdict(result),
                         }
                     )
                     shutil.rmtree(staging, ignore_errors=True)
+                    progress.update(1)
+                    progress.set_postfix_str("完成", refresh=True)
                     return result
 
-                backups = self._publish_files(publications, staging / "backups")
-                bundle = build_bundle(
-                    self.options.csv_dir,
-                    bundle_root=self.options.bundle_root,
-                    bundle_name=self.options.bundle_name,
-                    show_progress=self.options.show_progress,
-                    record_status=False,
-                    _maintenance_locked=True,
+                phase = "build"
+                self._write_status(
+                    {
+                        "status": "running",
+                        "phase": phase,
+                        **run_metadata,
+                        "staging_path": str(staging),
+                        "downloaded_batches": batch_count,
+                    }
+                )
+                build_arguments = {
+                    "stock": masters.stock,
+                    "etf": masters.etf,
+                    "index": masters.index,
+                    "trade_cal": masters.trade_cal,
+                    "bundle_root": self.options.bundle_root,
+                    "bundle_name": self.options.bundle_name,
+                    "staging_root": staging,
+                }
+                direct = build_parquet_bundle(
+                    cache_path,
+                    **build_arguments,
+                    merge_active=bool(len(active_sessions)) and not self.options.full,
+                    force_compact=self.options.compact,
                 )
                 bundle_published = True
+                phase = "reopen"
                 (staging / "BUNDLE_PUBLISHED").write_text(
-                    str(bundle.path), encoding="utf-8"
+                    str(direct.result.path), encoding="utf-8"
                 )
                 result = UpdateResult(
                     run_id=run_id,
                     updated_dates=tuple(dates),
-                    updated_files=len(publications),
-                    bundle_path=str(bundle.path),
+                    updated_files=len(direct.manifest["files"]),
+                    bundle_path=str(direct.result.path),
                     dry_run=False,
                 )
-                active_manifest = load_assets_manifest(bundle.path / "assets.pk")
+                active_manifest = load_manifest(direct.result.path)
                 completed_at = datetime.now(ZoneInfo("UTC")).isoformat()
                 self._write_status(
                     {
                         "status": "succeeded",
                         "phase": "reopen",
                         "active_generation": active_manifest["generation"],
-                        "storage": "hdf5",
+                        "storage": "parquet+duckdb",
                         "bundle_schema": active_manifest["schema_version"],
+                        "build_pipeline": direct.manifest["build_pipeline"],
                         "verification": {
                             "structural": "passed",
                             "sha256": "passed",
@@ -1107,28 +1200,34 @@ class DataUpdater:
                         },
                         **run_metadata,
                         "completed_at": completed_at,
+                        "downloaded_batches": batch_count,
                         "result": asdict(result),
                         "last_success": {
                             "run_id": run_id,
                             "completed_at": completed_at,
                             "updated_dates": dates,
-                            "updated_files": len(publications),
-                            "bundle_path": str(bundle.path),
+                            "updated_files": len(direct.manifest["files"]),
+                            "bundle_path": str(direct.result.path),
                         },
                     }
                 )
                 shutil.rmtree(staging, ignore_errors=True)
+                progress.update(1)
+                progress.set_postfix_str("完成", refresh=True)
                 return result
             except Exception as exc:
-                if backups and not bundle_published:
-                    self._restore_files(backups)
+                progress.set_postfix_str(f"失败：{phase}", refresh=True)
+                bundle_published = (
+                    bundle_published or (staging / "BUNDLE_PUBLISHED").is_file()
+                )
+                failed_phase = "reopen" if bundle_published else phase
                 (staging / "FAILED.txt").write_text(
                     f"{type(exc).__name__}: {exc}", encoding="utf-8"
                 )
                 self._write_status(
                     {
                         "status": "failed",
-                        "phase": "build" if publications else "download",
+                        "phase": failed_phase,
                         **run_metadata,
                         "completed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
                         "updated_dates": dates,
@@ -1140,8 +1239,11 @@ class DataUpdater:
                     }
                 )
                 raise DataError(
-                    f"update run {run_id} failed; staging retained at {staging}"
+                    f"update run {run_id} failed during {failed_phase}: "
+                    f"{type(exc).__name__}: {exc}; staging retained at {staging}"
                 ) from exc
+            finally:
+                progress.close()
 
 
 def token_from_stdin() -> str:

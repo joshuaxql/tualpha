@@ -1,4 +1,4 @@
-# TuAlpha 策略 API 参考
+# TuAlpha 1.3 策略 API 参考
 
 ## 回调
 
@@ -42,37 +42,44 @@ asset.is_etf
 ```python
 order(asset, amount)
 order_value(asset, value)
-order_target(asset, target)
-order_target_many(
-    {asset_a: target_a, asset_b: target_b},
-    position_limit=400,  # 可选；D+1 先卖后买后限制正市值标的数
-)
-order_target_value(asset, target)
 order_percent(asset, percent)
+order_target(asset, target)
+order_target_value(asset, target)
 order_target_percent(asset, target)
+
+order_many({asset_a: amount_a, asset_b: amount_b})
+order_value_many({asset_a: value_a, asset_b: value_b})
+order_percent_many({asset_a: percent_a, asset_b: percent_b})
+order_target_many(targets, position_limit=400)
+order_target_value_many(targets, position_limit=400)
+order_target_percent_many(targets, position_limit=400)
+
 cancel_order(order_object)
 get_open_orders()
 get_open_orders(asset)
 ```
 
 - `amount`：正数买入，负数卖出，单位股/份；
-- `value`：正数买入、负数卖出的近似人民币金额；
-- `target`：非负目标数量或目标市值；
-- `percent`：相对于当前组合价值的交易比例；
-- `order_target_percent`：非负目标权重，最常用；
-- `order_target_many`：按映射插入顺序批量提交目标数量，适合大型篮子并保持先卖后买的显式顺序；可选 `position_limit` 在 D+1 撮合时取消超过上限的新标的买单，不把退市零值审计残仓计入上限；
-- `order_target_many` 的买单在 D+1 按实际成交价和当时实际现金缩减至可负担交易单位；不足最小交易单位时取消且不记为现金不足拒单；
-- 单笔 `order_target_value` / `order_target_percent` 使用相同的 D+1 现金自适应规则；普通数量、金额和目标数量订单保留原现金不足拒单语义；
-- 金额和目标 API 使用当前原始收盘价估算数量，再按市场交易单位取整；
-- 下单仅允许在 `handle_data` 中；
-- 返回 `Order` 或在无需交易/无法形成有效数量时返回 `None`。
+- `value`：正数为买入总预算（包含费用），负数为卖出证券市值上限；
+- `percent`：相对于 D+1 撮合前、按成交端点价格重估的组合权益；非目标接口允许 `[-1, 1]`，目标接口允许 `[0, 1]`；
+- 六个 `_many` 接口接收有序 Mapping，保持映射插入顺序并返回 `list[Order]`；三个目标批量接口支持 `position_limit`；
+- `execution_time="open"` 使用 D+1 原始开盘价确定 value/percent 数量并撮合；`close` 使用 D+1 原始收盘价；
+- `order` 和单笔 `order_target` 是固定数量订单，买入时可能因 `insufficient_cash` 拒单；
+- value/percent 类接口及批量目标买单会按限定金额、实际现金和有效交易单位缩量，不使用 D 日收盘价预估最终数量；
+- 批量目标买单不足最小交易单位时状态为 `canceled`，`reject_reason="below_minimum_order"`，不得写成 `insufficient_cash`；
+- 所有批量接口保持显式映射顺序；需要先卖后买时，策略必须按该顺序构造 Mapping；
+- 下单仅允许在 `handle_data` 中；单笔接口返回 `Order | None`，批量接口返回 `list[Order]`。
 
 `Order` 常用属性：
 
 ```python
 order.id
 order.asset
-order.amount
+order.sizing  # quantity/value/percent/target_*
+order.requested  # 策略提交的原始参数
+order.amount  # D+1 解析后的有符号目标成交数量
+order.is_batch
+order.is_target
 order.created_session
 order.eligible_session
 order.status
@@ -82,7 +89,7 @@ order.reject_reason
 order.message
 ```
 
-不要在提交订单后立即把本地状态视为已成交。真实结果应从 `Order`、`result.orders` 和 `result.transactions` 判断。
+不要在提交订单后立即把本地状态视为已成交。value/percent 类订单在 D 日提交时最终 `amount` 尚未确定；真实结果应从 `Order`、`result.orders` 和 `result.transactions` 判断。
 
 ## 组合状态
 
@@ -121,6 +128,16 @@ arrays = data.current_arrays(assets, ["close", "daily_basic.total_mv"])
 ```
 
 `current_arrays()` 面向大型固定资产池，返回字段名到只读 NumPy 数组的映射，数组顺序与传入资产顺序一致；策略不得修改返回数组。
+
+长期重复扫描固定大资产池时，只在首次 `handle_data` 中预热一次：
+
+```python
+if not context.prefetched:
+    data.prefetch(context.assets, ["close", "volume", "daily_basic.total_mv"])
+    context.prefetched = True
+```
+
+`prefetch()` 不返回数据，也不能在 `initialize()` 中调用。它只优化物理列加载，不改变回调可见日期。
 
 `current()` 返回形状：
 
@@ -259,12 +276,11 @@ def initialize(context):
             etf_commission_rate=0.0003,
             stock_min_commission=5.0,
             etf_min_commission=5.0,
-            commission_includes_handling=True,
         )
     )
 ```
 
-除非用户明确要求，不要随意覆盖日期分段印花税、经手费和过户费规则。
+佣金统一视为包含交易所经手费，经手费不另计。除非用户明确要求，不要随意覆盖日期分段印花税和过户费规则。
 
 ## 运行入口
 

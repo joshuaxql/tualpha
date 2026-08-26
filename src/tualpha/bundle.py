@@ -1,33 +1,31 @@
-"""Fixed schema-7 HDF5 Bundle public API."""
+"""Compatibility facade for the immutable Parquet Bundle runtime API."""
 
 from __future__ import annotations
 
-from ._bundle_core import (
+from .data.bundle.manager import (
     BUNDLE_NAME,
-    BundleBuildResult,
-    acquire_bundle_read_lock,
-    paths_overlap,
-    release_bundle_read_lock,
-)
-from ._bundle_v8 import (
     BUNDLE_SCHEMA_VERSION,
     UPDATE_STATUS_SCHEMA_VERSION,
     LockedBundleData,
-    build_bundle,
+    acquire_bundle_read_lock,
     bundle_lock_path,
     bundle_parent,
     bundle_path,
     cleanup_legacy_storage,
     latest_bundle_path,
     load_bundle_data,
+    paths_overlap,
+    release_bundle_read_lock,
     update_status_path,
     validate_bundle_name,
     validate_hdf5_bundle,
+    validate_parquet_bundle,
 )
-from ._hdf5_store import REQUIRED_BUNDLE_FILES
+from .data.bundle.parquet_store import CATALOG_FILE, MANIFEST_FILE, PARQUET_DIRECTORY
+from .data.bundle.registry import BundleBuildResult
 
-REQUIRED_BUNDLE_ENTRIES = tuple(sorted(REQUIRED_BUNDLE_FILES))
-_validate_tualpha_files = validate_hdf5_bundle
+REQUIRED_BUNDLE_ENTRIES = (CATALOG_FILE, MANIFEST_FILE, PARQUET_DIRECTORY)
+_validate_tualpha_files = validate_parquet_bundle
 
 __all__ = [
     "BUNDLE_NAME",
@@ -37,7 +35,6 @@ __all__ = [
     "BundleBuildResult",
     "LockedBundleData",
     "acquire_bundle_read_lock",
-    "build_bundle",
     "bundle_lock_path",
     "bundle_parent",
     "bundle_path",
@@ -49,4 +46,5 @@ __all__ = [
     "update_status_path",
     "validate_bundle_name",
     "validate_hdf5_bundle",
+    "validate_parquet_bundle",
 ]

@@ -11,28 +11,30 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-# Avoid a background monitor thread while native HDF5 readers are active on Windows.
+# Avoid a background monitor thread during native DuckDB/Parquet reads on Windows.
 tqdm.monitor_interval = 0
 
-from .api import bind_algorithm
-from .assets import Asset, AssetFinder
-from .broker import SimulationBroker
-from .bundle import acquire_bundle_read_lock, release_bundle_read_lock
-from .calendar import ChinaTradingCalendar
-from .config import (
+from ..broker.costs import ChinaFeeModel
+from ..broker.market_rules import ChinaMarketRules
+from ..broker.simulation import SimulationBroker
+from ..config import (
     DEFAULT_BUNDLE_ROOT,
     AdjustmentMode,
     BacktestConfig,
     ExecutionTime,
     PlotlyJsMode,
 )
-from .costs import ChinaFeeModel
-from .data import BarData, BundleDataPortal
-from .exceptions import ConfigurationError, DataError, NoActiveAlgorithm
-from .metrics import calculate_metrics
-from .models import ClosedTrade, Order, Portfolio, Transaction
-from .result import BacktestResult
-from .rules import ChinaMarketRules
+from ..data.bar import BarData
+from ..data.bundle.manager import acquire_bundle_read_lock, release_bundle_read_lock
+from ..data.portal import BundleDataPortal
+from ..data.trading_calendar import ChinaTradingCalendar
+from ..exceptions import ConfigurationError, DataError, NoActiveAlgorithm
+from ..metrics import calculate_metrics
+from ..model.asset import Asset, AssetFinder
+from ..model.order import Order, OrderSizing, Transaction
+from ..model.portfolio import ClosedTrade, Portfolio
+from ..result import BacktestResult
+from .execution_context import bind_algorithm
 
 Initialize = Callable[[Any], None]
 HandleData = Callable[[Any, BarData], None]
@@ -158,58 +160,82 @@ class TradingAlgorithm:
         except DataError:
             return session + pd.Timedelta(days=1)
 
-    def submit_order(
+    def _submit_intent(
         self,
         asset: Asset | str,
-        amount: float,
+        requested: float,
+        sizing: OrderSizing,
         *,
         cash_adaptive: bool = False,
+        is_target: bool = False,
+        position_limit: int | None = None,
     ) -> Order:
         session = self._require_order_phase()
-        resolved = self.resolve_asset(asset)
         return self.broker.submit(
-            resolved,
-            amount,
+            self.resolve_asset(asset),
+            requested,
             created_session=session,
             eligible_session=self._next_eligible_session(session),
+            sizing=sizing,
+            position_limit=position_limit,
+            cash_adaptive=cash_adaptive,
+            is_target=is_target,
+        )
+
+    def _submit_intents(
+        self,
+        prepared: list[tuple[Asset, float, OrderSizing, bool]],
+        *,
+        position_limit: int | None = None,
+        cash_adaptive: bool = False,
+    ) -> list[Order]:
+        session = self._require_order_phase()
+        if position_limit is not None and position_limit <= 0:
+            raise ValueError("position_limit must be positive")
+        if not prepared:
+            return []
+        return self.broker.submit_many(
+            prepared,
+            created_session=session,
+            eligible_session=self._next_eligible_session(session),
+            position_limit=position_limit,
             cash_adaptive=cash_adaptive,
         )
 
-    def _raw_close(self, asset: Asset) -> float:
-        if self.current_session is None:
-            return np.nan
-        return self.data_portal.value(
-            asset, self.current_session, "close", adjusted=False
-        )
+    def submit_order(self, asset: Asset | str, amount: float) -> Order:
+        return self._submit_intent(asset, amount, OrderSizing.QUANTITY)
 
     def submit_order_value(self, asset: Asset | str, value: float) -> Order | None:
         self._require_order_phase()
-        resolved = self.resolve_asset(asset)
-        price = self._raw_close(resolved)
-        if not np.isfinite(price) or price <= 0 or abs(value) <= 1e-12:
+        if abs(value) <= 1e-12:
             return None
-        requested = abs(value) / price
-        if value > 0:
-            amount = self.market_rules.normalize_buy(resolved, requested)
-        else:
-            amount = -self.market_rules.normalize_sell(
-                resolved, requested, self.portfolio.amount(resolved)
-            )
-        return self.submit_order(resolved, amount) if abs(amount) > 1e-12 else None
+        return self._submit_intent(
+            asset,
+            value,
+            OrderSizing.VALUE,
+            cash_adaptive=True,
+        )
 
-    def submit_order_target(
-        self,
-        asset: Asset | str,
-        target: float,
-        *,
-        cash_adaptive: bool = False,
-    ) -> Order | None:
+    def submit_order_percent(self, asset: Asset | str, percent: float) -> Order | None:
+        self._require_order_phase()
+        if percent < -1 or percent > 1:
+            raise ValueError("order percent must be between -1 and 1")
+        if abs(percent) <= 1e-12:
+            return None
+        return self._submit_intent(
+            asset,
+            percent,
+            OrderSizing.PERCENT,
+            cash_adaptive=True,
+        )
+
+    def submit_order_target(self, asset: Asset | str, target: float) -> Order | None:
         self._require_order_phase()
         if target < 0:
             raise ValueError("negative target quantities would create a short position")
         resolved = self.resolve_asset(asset)
         current = self.portfolio.amount(resolved)
-        difference = target - current
+        difference = float(target) - current
         if abs(difference) <= 1e-9:
             return None
         if difference > 0:
@@ -218,50 +244,13 @@ class TradingAlgorithm:
             amount = -self.market_rules.normalize_sell(
                 resolved, abs(difference), current
             )
-        return (
-            self.submit_order(
-                resolved,
-                amount,
-                cash_adaptive=cash_adaptive,
-            )
-            if abs(amount) > 1e-12
-            else None
-        )
-
-    def submit_order_targets(
-        self,
-        targets: Mapping[Asset | str, float],
-        *,
-        position_limit: int | None = None,
-    ) -> list[Order]:
-        session = self._require_order_phase()
-        if position_limit is not None and position_limit <= 0:
-            raise ValueError("position_limit must be positive")
-        if any(target < 0 for target in targets.values()):
-            raise ValueError("negative target quantities would create a short position")
-        prepared: list[tuple[Asset, float]] = []
-        for asset, target in targets.items():
-            resolved = self.resolve_asset(asset)
-            current = self.portfolio.amount(resolved)
-            difference = float(target) - current
-            if abs(difference) <= 1e-9:
-                continue
-            if difference > 0:
-                amount = self.market_rules.normalize_buy(resolved, difference)
-            else:
-                amount = -self.market_rules.normalize_sell(
-                    resolved, abs(difference), current
-                )
-            if abs(amount) > 1e-12:
-                prepared.append((resolved, amount))
-        if not prepared:
-            return []
-        return self.broker.submit_many(
-            prepared,
-            created_session=session,
-            eligible_session=self._next_eligible_session(session),
-            position_limit=position_limit,
-            cash_adaptive=True,
+        if abs(amount) <= 1e-12:
+            return None
+        return self._submit_intent(
+            resolved,
+            amount,
+            OrderSizing.TARGET_QUANTITY,
+            is_target=True,
         )
 
     def submit_order_target_value(
@@ -271,12 +260,122 @@ class TradingAlgorithm:
         if target < 0:
             raise ValueError("negative target values would create a short position")
         resolved = self.resolve_asset(asset)
-        price = self._raw_close(resolved)
-        if not np.isfinite(price) or price <= 0:
+        if target <= 1e-12 and self.portfolio.amount(resolved) <= 1e-12:
             return None
-        return self.submit_order_target(
+        return self._submit_intent(
             resolved,
-            target / price,
+            target,
+            OrderSizing.TARGET_VALUE,
+            cash_adaptive=True,
+            is_target=True,
+        )
+
+    def submit_order_target_percent(
+        self, asset: Asset | str, target: float
+    ) -> Order | None:
+        self._require_order_phase()
+        if target < 0 or target > 1:
+            raise ValueError("target percent must be between 0 and 1")
+        resolved = self.resolve_asset(asset)
+        if target <= 1e-12 and self.portfolio.amount(resolved) <= 1e-12:
+            return None
+        return self._submit_intent(
+            resolved,
+            target,
+            OrderSizing.TARGET_PERCENT,
+            cash_adaptive=True,
+            is_target=True,
+        )
+
+    def submit_orders(self, requests: Mapping[Asset | str, float]) -> list[Order]:
+        prepared = [
+            (self.resolve_asset(asset), float(amount), OrderSizing.QUANTITY, False)
+            for asset, amount in requests.items()
+        ]
+        return self._submit_intents(prepared)
+
+    def submit_order_values(self, requests: Mapping[Asset | str, float]) -> list[Order]:
+        prepared = [
+            (self.resolve_asset(asset), float(value), OrderSizing.VALUE, False)
+            for asset, value in requests.items()
+            if abs(float(value)) > 1e-12
+        ]
+        return self._submit_intents(prepared, cash_adaptive=True)
+
+    def submit_order_percents(
+        self, requests: Mapping[Asset | str, float]
+    ) -> list[Order]:
+        if any(percent < -1 or percent > 1 for percent in requests.values()):
+            raise ValueError("order percents must be between -1 and 1")
+        prepared = [
+            (self.resolve_asset(asset), float(percent), OrderSizing.PERCENT, False)
+            for asset, percent in requests.items()
+            if abs(float(percent)) > 1e-12
+        ]
+        return self._submit_intents(prepared, cash_adaptive=True)
+
+    def submit_order_targets(
+        self,
+        targets: Mapping[Asset | str, float],
+        *,
+        position_limit: int | None = None,
+    ) -> list[Order]:
+        if any(target < 0 for target in targets.values()):
+            raise ValueError("negative target quantities would create a short position")
+        prepared: list[tuple[Asset, float, OrderSizing, bool]] = []
+        for asset, target in targets.items():
+            resolved = self.resolve_asset(asset)
+            current = self.portfolio.amount(resolved)
+            difference = float(target) - current
+            if abs(difference) > 1e-9:
+                prepared.append(
+                    (resolved, difference, OrderSizing.TARGET_QUANTITY, True)
+                )
+        return self._submit_intents(
+            prepared,
+            position_limit=position_limit,
+            cash_adaptive=True,
+        )
+
+    def submit_order_target_values(
+        self,
+        targets: Mapping[Asset | str, float],
+        *,
+        position_limit: int | None = None,
+    ) -> list[Order]:
+        if any(target < 0 for target in targets.values()):
+            raise ValueError("negative target values would create a short position")
+        prepared: list[tuple[Asset, float, OrderSizing, bool]] = []
+        for asset, target in targets.items():
+            resolved = self.resolve_asset(asset)
+            if target > 1e-12 or self.portfolio.amount(resolved) > 1e-12:
+                prepared.append(
+                    (resolved, float(target), OrderSizing.TARGET_VALUE, True)
+                )
+        return self._submit_intents(
+            prepared,
+            position_limit=position_limit,
+            cash_adaptive=True,
+        )
+
+    def submit_order_target_percents(
+        self,
+        targets: Mapping[Asset | str, float],
+        *,
+        position_limit: int | None = None,
+    ) -> list[Order]:
+        if any(target < 0 or target > 1 for target in targets.values()):
+            raise ValueError("target percents must be between 0 and 1")
+        prepared: list[tuple[Asset, float, OrderSizing, bool]] = []
+        for asset, target in targets.items():
+            resolved = self.resolve_asset(asset)
+            if target > 1e-12 or self.portfolio.amount(resolved) > 1e-12:
+                prepared.append(
+                    (resolved, float(target), OrderSizing.TARGET_PERCENT, True)
+                )
+        return self._submit_intents(
+            prepared,
+            position_limit=position_limit,
             cash_adaptive=True,
         )
 
@@ -343,9 +442,7 @@ class TradingAlgorithm:
             "turnover": turnover_value / previous_value if previous_value else 0.0,
             "commission": fees.commission,
             "stamp_tax": fees.stamp_tax,
-            "handling_fee": fees.handling_fee,
             "transfer_fee": fees.transfer_fee,
-            "included_handling_fee": fees.included_handling_fee,
             "fees": fees.total,
         }
         row.update(self._current_records)
@@ -479,6 +576,10 @@ class TradingAlgorithm:
             "eligible_session",
             "ts_code",
             "asset_type",
+            "sizing",
+            "requested",
+            "is_batch",
+            "is_target",
             "amount",
             "filled",
             "average_price",
@@ -493,6 +594,10 @@ class TradingAlgorithm:
                 "eligible_session": [order.eligible_session for order in orders],
                 "ts_code": [order.asset.ts_code for order in orders],
                 "asset_type": [order.asset.asset_type.value for order in orders],
+                "sizing": [order.sizing.value for order in orders],
+                "requested": [order.requested for order in orders],
+                "is_batch": [order.is_batch for order in orders],
+                "is_target": [order.is_target for order in orders],
                 "amount": [order.amount for order in orders],
                 "filled": [order.filled for order in orders],
                 "average_price": [order.average_price for order in orders],
@@ -519,7 +624,6 @@ class TradingAlgorithm:
             "gross_value",
             "commission",
             "stamp_tax",
-            "handling_fee",
             "transfer_fee",
             "fees",
         ]
@@ -542,9 +646,6 @@ class TradingAlgorithm:
                 ],
                 "stamp_tax": [
                     transaction.fees.stamp_tax for transaction in transactions
-                ],
-                "handling_fee": [
-                    transaction.fees.handling_fee for transaction in transactions
                 ],
                 "transfer_fee": [
                     transaction.fees.transfer_fee for transaction in transactions

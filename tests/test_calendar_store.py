@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
-from tualpha._calendar_store import (
+from tualpha.data.bundle.calendar_store import (
     SessionCalendar,
     normalize_trade_calendar,
     sessions_from_trade_calendar,
 )
-from tualpha._hdf5_store import ints_to_dates, load_trade_dates
 from tualpha.exceptions import DataError
 
 
@@ -65,18 +63,12 @@ def test_trade_calendar_rejects_conflicts_gaps_and_bad_pretrade_dates() -> None:
         normalize_trade_calendar(bad_previous)
 
 
-def test_trade_dates_npy_and_session_ordinals(tmp_path) -> None:
-    path = tmp_path / "trade_dates.npy"
-    np.save(path, np.array([20240102, 20240103], dtype="<i4"), allow_pickle=False)
-    stored = load_trade_dates(path)
-    sessions = ints_to_dates(stored)
-    calendar = SessionCalendar(sessions)
+def test_session_calendar_ordinals_and_ordering() -> None:
+    calendar = SessionCalendar(pd.DatetimeIndex(["2024-01-02", "2024-01-03"]))
 
-    assert stored.dtype == np.dtype("<i4")
     assert calendar.sessions.equals(pd.DatetimeIndex(["2024-01-02", "2024-01-03"]))
     assert calendar.next_session("2024-01-02") == pd.Timestamp("2024-01-03")
     assert calendar.previous_session("2024-01-03") == pd.Timestamp("2024-01-02")
 
-    np.save(path, np.array([20240103, 20240102], dtype="<i4"), allow_pickle=False)
     with pytest.raises(DataError, match="strictly increasing"):
-        load_trade_dates(path)
+        SessionCalendar(pd.DatetimeIndex(["2024-01-03", "2024-01-02"]))

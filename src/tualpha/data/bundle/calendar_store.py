@@ -5,11 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 
-from ._hdf5_store import ints_to_dates, load_assets_manifest, load_trade_dates
-from .exceptions import DataError
+from ...exceptions import DataError
+from .parquet_store import CATALOG_FILE, load_manifest
 
 CALENDAR_NAME = "XSHG"
 CALENDAR_SOURCE = "tushare.trade_cal"
@@ -226,8 +227,19 @@ def sessions_from_trade_calendar(
 
 def load_bundle_calendar(bundle_path: str | Path) -> SessionCalendar:
     root = Path(bundle_path)
-    manifest = load_assets_manifest(root / "assets.pk")
-    sessions = ints_to_dates(load_trade_dates(root / "trade_dates.npy"))
+    manifest = load_manifest(root)
+    connection = duckdb.connect(str(root / CATALOG_FILE), read_only=True)
+    try:
+        values = connection.execute(
+            "SELECT cal_date FROM trade_calendar "
+            "WHERE exchange = 'SSE' AND CAST(is_open AS INTEGER) = 1 "
+            "ORDER BY cal_date"
+        ).fetchall()
+    finally:
+        connection.close()
+    sessions = pd.DatetimeIndex(
+        pd.to_datetime([str(value[0]) for value in values], format="%Y%m%d")
+    )
     if len(sessions) != int(manifest["session_count"]):
-        raise DataError("Bundle calendar session count does not match assets.pk")
+        raise DataError("Bundle calendar session count does not match manifest")
     return SessionCalendar(sessions)

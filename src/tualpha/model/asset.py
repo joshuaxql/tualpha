@@ -7,17 +7,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
-from ._hdf5_store import load_assets_manifest
-from .bundle import (
+from ..config import normalize_session
+from ..data.bundle.manager import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,
     latest_bundle_path,
     release_bundle_read_lock,
 )
-from .config import normalize_session
-from .exceptions import DataError, SymbolNotFound
+from ..data.bundle.parquet_store import CATALOG_FILE, load_manifest
+from ..exceptions import DataError, SymbolNotFound
 
 
 class AssetType(StrEnum):
@@ -101,11 +102,18 @@ class AssetFinder:
         lock_key, _ = acquire_bundle_read_lock(self.bundle_root, bundle_name)
         try:
             self.bundle_path = latest_bundle_path(self.bundle_root, bundle_name)
-            manifest = load_assets_manifest(self.bundle_path / "assets.pk")
+            manifest = load_manifest(self.bundle_path)
             self.bundle_generation = str(manifest["generation"])
-            rows = [
-                row for row in manifest["assets"] if bool(row.get("tradable", False))
-            ]
+            connection = duckdb.connect(
+                str(self.bundle_path / CATALOG_FILE), read_only=True
+            )
+            try:
+                frame = connection.execute(
+                    "SELECT * FROM assets WHERE tradable = TRUE ORDER BY sid"
+                ).fetchdf()
+            finally:
+                connection.close()
+            rows = frame.to_dict("records")
         finally:
             release_bundle_read_lock(lock_key)
         if not rows:

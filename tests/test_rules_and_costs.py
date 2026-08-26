@@ -249,13 +249,10 @@ def test_fee_breakdown_avoids_duplicate_handling() -> None:
     assert stock_sell.commission == 30.0
     assert stock_sell.stamp_tax == 50.0
     assert stock_sell.transfer_fee == 1.0
-    assert stock_sell.handling_fee == 0.0
-    assert stock_sell.included_handling_fee == 3.41
     assert stock_sell.total == 81.0
 
     historical = model.calculate(stock, 100_000, is_sell=True, session="2023-08-25")
     assert historical.stamp_tax == 100.0
-    assert historical.included_handling_fee == 4.87
 
     etf_sell = model.calculate(etf, 100_000, is_sell=True, session="2024-01-02")
     assert etf_sell.stamp_tax == 0.0

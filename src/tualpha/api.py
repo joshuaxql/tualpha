@@ -1,0 +1,43 @@
+"""Compatibility facade for strategy APIs; prefer :mod:`tualpha.apis`."""
+
+from .apis.strategy import (
+    bind_algorithm,
+    cancel_order,
+    get_open_orders,
+    order,
+    order_many,
+    order_percent,
+    order_percent_many,
+    order_target,
+    order_target_many,
+    order_target_percent,
+    order_target_percent_many,
+    order_target_value,
+    order_target_value_many,
+    order_value,
+    order_value_many,
+    record,
+    set_commission,
+    symbol,
+)
+
+__all__ = [
+    "bind_algorithm",
+    "cancel_order",
+    "get_open_orders",
+    "order",
+    "order_many",
+    "order_percent",
+    "order_percent_many",
+    "order_target",
+    "order_target_many",
+    "order_target_percent",
+    "order_target_percent_many",
+    "order_target_value",
+    "order_target_value_many",
+    "order_value",
+    "order_value_many",
+    "record",
+    "set_commission",
+    "symbol",
+]

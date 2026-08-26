@@ -1,4 +1,4 @@
-"""Point-in-time market-data API backed by the schema-7 HDF5 Bundle."""
+"""Point-in-time market-data API backed by DuckDB and Parquet."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .assets import Asset
-from .config import normalize_session
+from ..config import normalize_session
+from ..model.asset import Asset
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +36,7 @@ class DailyBar:
         return float(getattr(self, name))
 
 
-from ._data_v8 import BundleDataPortal
+from .portal import BundleDataPortal
 
 TushareDataPortal = BundleDataPortal
 
@@ -100,6 +100,15 @@ class BarData:
                 name=field_list[0],
             )
         return pd.DataFrame(values, index=index)
+
+    def prefetch(
+        self, assets: Asset | Iterable[Asset], fields: str | Iterable[str]
+    ) -> None:
+        """Warm repeated cross-sectional columns without exposing physical storage."""
+
+        asset_list, _ = self._asset_list(assets)
+        field_list, _ = self._field_list(fields)
+        self._portal.prefetch(asset_list, field_list)
 
     def current_arrays(
         self, assets: Asset | Iterable[Asset], fields: str | Iterable[str]

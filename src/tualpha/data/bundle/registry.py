@@ -1,21 +1,22 @@
-"""Bundle coordination, stable assets, and publication locks."""
+"""Bundle locks, stable asset identifiers, and publication coordination."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+import duckdb
 import pandas as pd
 from filelock import FileLock
 
-from ._hdf5_store import load_assets_manifest
-from .config import DEFAULT_BUNDLE_ROOT
-from .exceptions import DataError
+from ...config import DEFAULT_BUNDLE_ROOT
+from ...exceptions import DataError
+from .legacy_manifest import load_legacy_assets_manifest
 
 BUNDLE_NAME = "tualpha"
 SID_MAP_VERSION = 1
@@ -53,9 +54,6 @@ def validate_bundle_name(bundle_name: str) -> str:
             "must not contain path separators, and must be at most 64 characters"
         )
     return bundle_name
-
-
-_legacy_validate_bundle_name = validate_bundle_name
 
 
 def paths_overlap(first: str | Path, second: str | Path) -> bool:
@@ -110,14 +108,27 @@ def update_status_path(bundle_root: str | Path = DEFAULT_BUNDLE_ROOT) -> Path:
 
 
 class SidRegistry:
-    """Stable sid mapping recovered from the active Bundle or legacy sid map."""
+    """Recover stable sid mappings from the active Bundle or legacy sid map."""
 
     def __init__(self, bundle_root: Path) -> None:
         self.bundle_root = bundle_root
         self.mapping: dict[str, int] = {}
+        catalog = bundle_root / "bundle" / "catalog.duckdb"
+        if catalog.is_file():
+            connection = duckdb.connect(str(catalog), read_only=True)
+            try:
+                self.mapping = {
+                    str(code).upper(): int(sid)
+                    for code, sid in connection.execute(
+                        "SELECT ts_code, sid FROM assets"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+            return
         active = bundle_root / "bundle" / "assets.pk"
         if active.is_file():
-            manifest = load_assets_manifest(active)
+            manifest = load_legacy_assets_manifest(active)
             self.mapping = {
                 str(asset["ts_code"]).upper(): int(asset["sid"])
                 for asset in manifest["assets"]
@@ -140,137 +151,3 @@ class SidRegistry:
                 self.mapping[code] = next_sid
                 next_sid += 1
         return {str(code).upper(): self.mapping[str(code).upper()] for code in codes}
-
-
-def _parse_date(value: object) -> pd.Timestamp | None:
-    text = str(value).strip()
-    if not text or text.lower() == "nan":
-        return None
-    try:
-        return pd.to_datetime(text, format="%Y%m%d").normalize()
-    except ValueError as exc:
-        raise DataError(f"invalid asset date: {value}") from exc
-
-
-def load_bundle_assets(
-    csv_dir: Path,
-    observations: Mapping[tuple[str, str], tuple[pd.Timestamp, pd.Timestamp]],
-    sid_registry: SidRegistry,
-    bundle_end: pd.Timestamp,
-) -> list[BundleAssetRecord]:
-    stock_frame = pd.read_csv(
-        csv_dir / "stock_basic.csv", dtype=str, keep_default_na=False
-    )
-    etf_frame = pd.read_csv(csv_dir / "etf_basic.csv", dtype=str, keep_default_na=False)
-    drafts: list[dict[str, object]] = []
-    board_map = {
-        "主板": "main",
-        "创业板": "chinext",
-        "科创板": "star",
-        "北交所": "bse",
-    }
-    exchange_map = {
-        "SSE": "SSE",
-        "SZSE": "SZSE",
-        "BSE": "BSE",
-        "SH": "SSE",
-        "SZ": "SZSE",
-    }
-    for row in stock_frame.to_dict("records"):
-        code = str(row.get("ts_code", "")).upper()
-        observed = observations.get((code, "stock"))
-        if not code or observed is None:
-            continue
-        first_observed, _ = observed
-        list_date = _parse_date(row.get("list_date")) or first_observed
-        delist_date = _parse_date(row.get("delist_date"))
-        end_date = (
-            min(bundle_end, delist_date) if delist_date is not None else bundle_end
-        )
-        drafts.append(
-            {
-                "ts_code": code,
-                "name": str(row.get("name", "")),
-                "asset_type": "stock",
-                "exchange": exchange_map.get(str(row.get("exchange", "")), "SSE"),
-                "board": board_map.get(str(row.get("market", "")), "unknown"),
-                "price_tick": 0.01,
-                "start_date": max(list_date, first_observed),
-                "end_date": end_date,
-            }
-        )
-    for row in etf_frame.to_dict("records"):
-        code = str(row.get("ts_code", "")).upper()
-        observed = observations.get((code, "etf"))
-        if not code or observed is None:
-            continue
-        first_observed, last_observed = observed
-        list_date = _parse_date(row.get("list_date")) or first_observed
-        end_date = (
-            bundle_end if str(row.get("list_status", "")) == "L" else last_observed
-        )
-        drafts.append(
-            {
-                "ts_code": code,
-                "name": str(row.get("extname") or row.get("csname") or ""),
-                "asset_type": "etf",
-                "exchange": exchange_map.get(str(row.get("exchange", "")), "SSE"),
-                "board": "etf",
-                "price_tick": 0.001,
-                "start_date": max(list_date, first_observed),
-                "end_date": min(bundle_end, end_date),
-            }
-        )
-    sid_map = sid_registry.assign([str(draft["ts_code"]) for draft in drafts])
-    return [
-        BundleAssetRecord(sid=sid_map[str(draft["ts_code"])], **draft)
-        for draft in drafts
-        if draft["start_date"] <= draft["end_date"]
-    ]
-
-
-def load_benchmark_assets(
-    observations: Mapping[tuple[str, str], tuple[pd.Timestamp, pd.Timestamp]],
-    sid_registry: SidRegistry,
-    bundle_start: pd.Timestamp,
-    bundle_end: pd.Timestamp,
-) -> list[BundleAssetRecord]:
-    codes = sorted(code for (code, asset_type) in observations if asset_type == "index")
-    sid_map = sid_registry.assign(codes)
-    records: list[BundleAssetRecord] = []
-    for code in codes:
-        first_date, last_date = observations[(code, "index")]
-        start_date = max(bundle_start, first_date)
-        end_date = min(bundle_end, last_date)
-        if start_date > end_date:
-            continue
-        suffix = code.rsplit(".", 1)[-1] if "." in code else "INDEX"
-        records.append(
-            BundleAssetRecord(
-                sid=sid_map[code],
-                ts_code=code,
-                name=code,
-                asset_type="index",
-                exchange=suffix,
-                board="index",
-                price_tick=0.01,
-                start_date=start_date,
-                end_date=end_date,
-            )
-        )
-    return records
-
-
-def reject_interrupted_data_update(root: Path) -> None:
-    path = update_status_path(root)
-    if not path.is_file():
-        return
-    try:
-        status = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if status.get("operation") == "data_update" and status.get("status") == "running":
-        raise DataError(
-            "a previous data update was interrupted; run `tualpha update` to "
-            "recover CSV files before building a Bundle"
-        )
