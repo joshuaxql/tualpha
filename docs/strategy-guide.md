@@ -118,7 +118,20 @@ end_date <= 当前回调日
 
 公告日当天不可见。利润表和现金流量表是年初至今累计值，不应直接命名为单季度值。
 
-## 指数成分 PIT
+## 指数日线与成分 PIT
+
+指数不可交易，但可以在回调中读取配置白名单内的原始指数点位：
+
+```python
+close = data.index_current("000300.SH", "close")
+values = data.index_current("000300.SH", ["close", "volume"])
+closes = data.index_history("000300.SH", "close", 20)
+bars = data.index_history("000300.SH", ["open", "high", "low", "close"], 20)
+```
+
+支持 `open`、`high`、`low`、`close`/`price`、`pre_close`、`volume` 和 `turnover`。指数日线始终为原始点位，不受 `raw`、`qfq` 或 `hfq` 设置影响；历史窗口包含当前回调日，不能超过回测结束日。
+
+指数成分：
 
 ```python
 members = data.index_constituents("000300.SH")

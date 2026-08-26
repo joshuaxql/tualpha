@@ -49,6 +49,18 @@ _EXTENDED_DAILY_NAMESPACES = frozenset(
 _FINANCIAL_NAMESPACES = frozenset(FINANCE_SPECS)
 _DEFAULT_COLUMN_CACHE_MIB = 2048
 _INDEX_FRAME_CACHE_SIZE = 128
+_INDEX_DAILY_FIELDS = frozenset(
+    {"open", "high", "low", "close", "price", "pre_close", "volume", "turnover"}
+)
+_INDEX_DAILY_COLUMNS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "pre_close",
+    "volume",
+    "turnover",
+)
 
 _BASE_STORAGE = {
     "open": ("daily", "open"),
@@ -253,6 +265,7 @@ class BundleDataPortal:
             self._loaded_positions: dict[str, np.ndarray] = {}
             self._categories: dict[str, tuple[str, ...]] = {}
             self._finance_cache: dict[tuple[int, str], pd.DataFrame] = {}
+            self._index_daily_frames: dict[str, pd.DataFrame] = {}
             self._index_arrays: dict[str, pd.DataFrame] = {}
             self._index_frames: OrderedDict[tuple[str, str], pd.DataFrame] = (
                 OrderedDict()
@@ -366,6 +379,8 @@ class BundleDataPortal:
     def available_fields(self, namespace: str | None = None) -> tuple[str, ...]:
         if namespace is None:
             return tuple(sorted((*_DAILY_FIELDS, *self._financial_fields)))
+        if namespace == "index":
+            return tuple(sorted(_INDEX_DAILY_FIELDS))
         if namespace in _EXTENDED_DAILY_NAMESPACES:
             return tuple(
                 sorted(
@@ -1104,6 +1119,78 @@ class BundleDataPortal:
             .reindex(columns=names)
         )
 
+    def _index_daily_frame(self, index_code: str) -> pd.DataFrame:
+        code = index_code.upper().strip()
+        cached = self._index_daily_frames.get(code)
+        if cached is not None:
+            return cached
+        selected = ", ".join(("trade_date", *_INDEX_DAILY_COLUMNS))
+        frame = self._connection.execute(
+            f"SELECT {selected} FROM index_daily "
+            "WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date",
+            [code, self.backtest_end.strftime("%Y%m%d")],
+        ).fetchdf()
+        if frame.empty:
+            raise KeyError(f"index daily data are unavailable for {index_code!r}")
+        frame.index = pd.to_datetime(
+            frame.pop("trade_date").astype(str), format="%Y%m%d"
+        )
+        frame.index.name = "trade_date"
+        for column in _INDEX_DAILY_COLUMNS:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(float)
+        for column in ("volume", "turnover"):
+            frame[column] = frame[column].clip(lower=0.0)
+        self._index_daily_frames[code] = frame
+        return frame
+
+    @staticmethod
+    def _validate_index_daily_fields(fields: Sequence[str]) -> list[str]:
+        names = list(fields)
+        unknown = set(names).difference(_INDEX_DAILY_FIELDS)
+        if unknown:
+            raise KeyError(f"unknown index daily field: {min(unknown)}")
+        return names
+
+    def index_value(
+        self,
+        index_code: str,
+        session: str | pd.Timestamp,
+        field: str,
+    ) -> float:
+        """Return one raw index daily value visible on ``session``."""
+
+        date = normalize_session(session)
+        if date > self.backtest_end:
+            raise DataError("index daily query cannot exceed backtest end")
+        self._validate_index_daily_fields([field])
+        frame = self._index_daily_frame(index_code)
+        column = "close" if field == "price" else field
+        if date not in frame.index:
+            return np.nan
+        return _as_float(frame.at[date, column])
+
+    def index_history(
+        self,
+        index_code: str,
+        fields: Sequence[str],
+        end_session: str | pd.Timestamp,
+        bar_count: int,
+    ) -> pd.DataFrame:
+        """Return raw index daily fields over a callback-visible session window."""
+
+        date = normalize_session(end_session)
+        if date > self.backtest_end:
+            raise DataError("index daily query cannot exceed backtest end")
+        names = self._validate_index_daily_fields(fields)
+        sessions = self.calendar.window(date, bar_count, include_end=True)
+        source = self._index_daily_frame(index_code)
+        result = pd.DataFrame(index=sessions)
+        result.index.name = "trade_date"
+        for field in names:
+            column = "close" if field == "price" else field
+            result[field] = source[column].reindex(sessions).to_numpy(dtype=float)
+        return result
+
     def _index_values(self, code: str) -> pd.DataFrame:
         key = code.upper().strip()
         cached = self._index_arrays.get(key)
@@ -1212,6 +1299,7 @@ class BundleDataPortal:
         self._loaded_positions.clear()
         self._categories.clear()
         self._finance_cache.clear()
+        self._index_daily_frames.clear()
         self._index_arrays.clear()
         self._index_frames.clear()
         self._bar_presence = None

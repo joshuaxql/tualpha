@@ -227,6 +227,49 @@ def test_financial_queries_are_announcement_point_in_time(data_root: Path) -> No
     portal.close()
 
 
+def test_index_daily_is_readable_from_strategy_bar_data(data_root: Path) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    portal = TushareDataPortal(data_root, finder, calendar, "qfq", "2024-01-08")
+    data = BarData(portal)
+    data._set_session("2024-01-04")
+
+    assert data.index_current("000985.csi", "close") == 102.0
+    assert data.index_current("000985.CSI", "price") == 102.0
+    current = data.index_current("000985.CSI", ["open", "close", "volume"])
+    assert current.to_dict() == {"open": 102.0, "close": 102.0, "volume": 1000.0}
+
+    history = data.index_history("000985.CSI", "close", 3)
+    assert history.name == "000985.CSI"
+    assert list(history.index.strftime("%Y%m%d")) == [
+        "20240102",
+        "20240103",
+        "20240104",
+    ]
+    assert history.tolist() == [100.0, 101.0, 102.0]
+    fields = data.index_history("000985.CSI", ["open", "high", "price"], 2)
+    assert fields.columns.tolist() == ["open", "high", "price"]
+    assert fields.iloc[-1].tolist() == [102.0, 103.0, 102.0]
+    assert data.available_fields("index") == (
+        "close",
+        "high",
+        "low",
+        "open",
+        "pre_close",
+        "price",
+        "turnover",
+        "volume",
+    )
+
+    with pytest.raises(KeyError, match="unknown index daily field"):
+        data.index_current("000985.CSI", "adj_factor")
+    with pytest.raises(KeyError, match="index daily data are unavailable"):
+        data.index_history("MISSING.INDEX", "close", 2)
+    with pytest.raises(DataError, match="cannot exceed backtest end"):
+        portal.index_history("000985.CSI", ["close"], "2024-01-09", 2)
+    portal.close()
+
+
 def test_index_constituents_are_strictly_point_in_time(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)

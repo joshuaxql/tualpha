@@ -1,6 +1,6 @@
 [project]
 name = "tualpha"
-version = "1.3.2"
+version = "1.3.3"
 description = "Event-driven daily backtesting for China A-share stocks and ETFs"
 readme = "README.md"
 keywords = ["backtest", "quant", "a-share", "etf", "tushare"]

@@ -216,6 +216,23 @@ reports = data.fundamentals(
 - 默认只选择合并报表 `report_type="1"`；
 - `fina_indicator` 没有 report type 过滤。
 
+## 指数日线
+
+```python
+close = data.index_current("000300.SH", "close")
+values = data.index_current("000300.SH", ["close", "volume"])
+closes = data.index_history("000300.SH", "close", 20)
+bars = data.index_history("000300.SH", ["open", "high", "low", "close"], 20)
+```
+
+- 支持 `open`、`high`、`low`、`close` / `price`、`pre_close`、`volume` 和 `turnover`；
+- 单字段当前值返回 `float`，多字段返回 `Series`；
+- 单字段历史返回日期索引 `Series`，多字段返回日期 × 字段 `DataFrame`；
+- 历史窗口包含当前回调日，不能读取未来日或超过回测结束日；
+- 指数点位始终为原始值，不受策略复权模式影响；
+- 指数不可通过 `symbol()` 解析，也不能下单；
+- `data.available_fields("index")` 返回支持的指数字段。
+
 ## PIT 指数成分
 
 ```python

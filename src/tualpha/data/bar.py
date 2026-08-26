@@ -196,6 +196,46 @@ class BarData:
             report_type=report_type,
         )
 
+    def index_current(
+        self, index_code: str, fields: str | Iterable[str]
+    ) -> float | pd.Series:
+        """Return raw index daily values for the current callback session."""
+
+        field_list, one_field = self._field_list(fields)
+        if one_field:
+            return self._portal.index_value(
+                index_code, self.current_session, field_list[0]
+            )
+        return pd.Series(
+            {
+                field: self._portal.index_value(index_code, self.current_session, field)
+                for field in field_list
+            },
+            name=index_code.upper().strip(),
+            dtype=float,
+        )
+
+    def index_history(
+        self,
+        index_code: str,
+        fields: str | Iterable[str],
+        bar_count: int,
+    ) -> pd.Series | pd.DataFrame:
+        """Return raw index daily history ending at the current callback session."""
+
+        field_list, one_field = self._field_list(fields)
+        frame = self._portal.index_history(
+            index_code,
+            field_list,
+            self.current_session,
+            bar_count,
+        )
+        if one_field:
+            result = frame[field_list[0]]
+            result.name = index_code.upper().strip()
+            return result
+        return frame
+
     def index_constituents(self, index_code: str) -> pd.DataFrame:
         """Return the latest index constituents visible before this session."""
 

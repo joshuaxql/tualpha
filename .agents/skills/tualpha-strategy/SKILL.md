@@ -35,7 +35,7 @@ metadata:
 
 仅在无法安全推断时，一次性确认：
 
-- 策略类型及候选股票/ETF；指数只能作为基准或 PIT 成分来源；
+- 策略类型及候选股票/ETF；指数不可交易，但可读取日线、作为基准或 PIT 成分来源；
 - 信号公式、窗口、调仓频率、持仓数量和空仓条件；
 - 回测日期、初始资金和基准；
 - `raw`、`qfq` 或 `hfq`，默认推荐 `qfq`；
@@ -102,6 +102,7 @@ if __name__ == "__main__":
 - 固定大型资产池：首次 `handle_data` 调用一次 `data.prefetch()`，不能在 `initialize()` 中调用；
 - 原始价格：仅确有需要时使用 `data.raw_current()`；
 - 财务：`data.fundamental()` / `data.fundamentals()`；
+- 指数日线：`data.index_current()` / `data.index_history()`，始终为原始点位；
 - PIT 指数成分：`data.index_constituents()`；
 - 字段发现：`data.available_fields()`。
 

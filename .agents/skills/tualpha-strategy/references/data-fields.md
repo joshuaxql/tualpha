@@ -129,9 +129,18 @@ if is_st == 1:
     ...
 ```
 
-## 指数成分与权重
+## 指数日线、成分与权重
 
-`data.index_constituents(index_code)` 返回月度指数快照，`weight` 单位是百分比而非 0～1 小数。D 日快照严格从 D+1 可见；它不属于 `current()` / `history()` 字段，也不能用于指数下单。
+指数日线通过专用接口读取：
+
+```python
+close = data.index_current("000300.SH", "close")
+history = data.index_history("000300.SH", ["close", "volume"], 20)
+```
+
+支持字段为 `open`、`high`、`low`、`close` / `price`、`pre_close`、`volume` 和 `turnover`。价格是原始指数点位，不应用前复权或后复权；`volume` 和 `turnover` 保持 Bundle 中的 Tushare 指数口径。指数不可交易。
+
+`data.index_constituents(index_code)` 返回月度指数快照，`weight` 单位是百分比而非 0～1 小数。D 日快照严格从 D+1 可见；它不属于普通 `current()` / `history()` 字段，也不能用于指数下单。
 
 ## 财务数据
 

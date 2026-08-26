@@ -1,5 +1,13 @@
 # 版本记录
 
+## 1.3.3
+
+- 新增策略回调指数日线读取接口 `data.index_current()`；
+- 新增回调可见历史窗口接口 `data.index_history()`；
+- 支持原始指数 OHLC、昨收、成交量和成交额；
+- `data.available_fields("index")` 可发现支持字段；
+- 指数仍不可交易，指数日线不参与 `raw`、`qfq` 或 `hfq` 复权。
+
 ## 1.3.2
 
 - 日频增量改为按数据集检查，只下载缺失交易日；
@@ -28,6 +36,7 @@
 
 | TuAlpha | Python | Pandas | 存储 |
 |---|---:|---:|---|
+| 1.3.3 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.2 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.1 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.0 | 3.12+ | 2.2+ | Parquet + DuckDB |

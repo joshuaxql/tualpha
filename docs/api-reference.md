@@ -22,6 +22,15 @@
 
 ::: tualpha.data.bar.BarData
 
+### 指数日线
+
+`BarData.index_current()` 和 `BarData.index_history()` 按指数代码读取当前或历史原始点位。指数不可下单，读取结果不参与股票/ETF 复权。
+
+```python
+close = data.index_current("000300.SH", "close")
+history = data.index_history("000300.SH", ["close", "volume"], 20)
+```
+
 ## 订单接口
 
 ::: tualpha.apis.strategy.order
