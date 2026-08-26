@@ -28,7 +28,7 @@ apis → core.execution_context
 core.algorithm → broker + data + model
 broker → data.bar + model
 DataPortal → DuckDB query + model.asset + calendar
-bundle importer/updater → Parquet schema + Catalog + publication
+bundle builder/updater → Parquet schema + Catalog + publication
 quality → DuckDB query + table registry
 ```
 
@@ -61,7 +61,8 @@ D+1
 ## Bundle 更新
 
 ```text
-Tushare → 可续传分区 CSV
+Tushare → 检测各数据集缺失交易日
+        → 可续传分区 CSV
         → hardlink 复用未变化年度 Parquet
         → 重写受影响年份
         → catalog.duckdb + manifest.json

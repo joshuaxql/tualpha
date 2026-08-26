@@ -31,7 +31,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/joshuaxql/tualpha"
 Repository = "https://github.com/joshuaxql/tualpha"
-Documentation = "https://github.com/joshuaxql/tualpha#readme"
+Documentation = "https://tualpha.readthedocs.io/"
 Issues = "https://github.com/joshuaxql/tualpha/issues"
 
 [project.scripts]
@@ -46,6 +46,10 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.9",
+]
+docs = [
+    "mkdocs==1.6.1",
+    "mkdocstrings[python]>=1.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,66 @@
+site_name: TuAlpha
+site_description: 面向中国 A 股与 ETF 的日频事件驱动回测框架
+site_author: joshuaxql
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "http://127.0.0.1:8000/"]
+
+repo_name: joshuaxql/tualpha
+repo_url: https://github.com/joshuaxql/tualpha
+edit_uri: edit/master/docs/
+copyright: TuAlpha 仅用于量化研究、软件开发与回测验证
+
+docs_dir: docs
+strict: true
+
+theme:
+  name: readthedocs
+  highlightjs: true
+  hljs_languages:
+    - python
+    - bash
+    - sql
+
+nav:
+  - 首页: index.md
+  - 快速开始: getting-started.md
+  - 策略开发: strategy-guide.md
+  - 数据管理: data-management.md
+  - API 参考: api-reference.md
+  - CLI 参考: cli-reference.md
+  - 架构说明: architecture.md
+  - Bundle 格式: bundle-format.md
+  - 版本记录: changelog.md
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            docstring_style: google
+            heading_level: 2
+            members_order: source
+            merge_init_into_class: true
+            separate_signature: true
+            show_root_heading: true
+            show_source: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - fenced_code
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+extra_css:
+  - stylesheets/extra.css

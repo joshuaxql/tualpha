@@ -8,6 +8,9 @@
   <a href="https://pypi.org/project/tualpha/">
     <img src="https://img.shields.io/pypi/v/tualpha?style=flat-square&color=007ec6" alt="PyPI Version">
   </a>
+  <a href="https://tualpha.readthedocs.io/">
+    <img src="https://readthedocs.org/projects/tualpha/badge/?version=latest" alt="Documentation Status">
+  </a>
   <img src="https://img.shields.io/badge/python-3.12-blue?style=flat-square" alt="Python 3.12">
   <img src="https://img.shields.io/badge/storage-Parquet%20%2B%20DuckDB-orange?style=flat-square" alt="Parquet and DuckDB">
   <img src="https://img.shields.io/badge/data-Tushare-green?style=flat-square" alt="Tushare">
@@ -24,7 +27,7 @@
 - **完整数据质量报告**：覆盖 schema、主键、分区、日期、OHLC、复权、财务 PIT、指数权重和跨表引用，输出 HTML、JSON 与 CSV。
 - **可解释回测结果**：生成中文 Plotly HTML 报告、每日持仓、订单、成交、已平仓交易、组合归因和用户自定义记录。
 
-👉 **[架构说明](docs/architecture.md)** | **[Bundle 格式](docs/bundle-format.md)** | **[策略 Skill](.agents/skills/tualpha-strategy/SKILL.md)**
+👉 **[在线文档](https://tualpha.readthedocs.io/)** | **[架构说明](docs/architecture.md)** | **[Bundle 格式](docs/bundle-format.md)** | **[策略 Skill](.agents/skills/tualpha-strategy/SKILL.md)**
 
 ## 安装说明
 
@@ -273,6 +276,7 @@ report.html
 
 ## 文档索引
 
+- 🌐 **[Read the Docs 在线文档](https://tualpha.readthedocs.io/)**：安装、策略、数据、API、CLI、架构和版本文档。
 - 📖 **[架构说明](docs/architecture.md)**：模块职责、事件顺序、查询热路径和原子发布。
 - 💾 **[Bundle 格式](docs/bundle-format.md)**：Parquet 分区、Catalog、manifest、PIT 和完整性协议。
 - 🧠 **[策略 Skill](.agents/skills/tualpha-strategy/SKILL.md)**：策略生成、迁移、审查和验证规范。
@@ -301,10 +305,17 @@ uv run ruff format --check .
 uv run pytest -q
 ```
 
-当前基线：
+文档严格构建：
+
+```bash
+uv sync --group docs
+uv run mkdocs build --strict
+```
+
+当前测试基线：
 
 ```text
-89 passed
+94 passed
 ```
 
 ## 支持边界

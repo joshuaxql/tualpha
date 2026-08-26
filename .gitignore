@@ -12,6 +12,7 @@ wheels/
 # Test and tool caches
 .coverage
 htmlcov/
+site/
 .pytest_cache/
 .ruff_cache/
 

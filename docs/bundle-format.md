@@ -120,7 +120,7 @@ Tushare
   → 原子替换 bundle/
 ```
 
-财务按记录的 `end_date` 重写对应报告年份。指数权重按整个 `(index_code, snapshot_date)` 快照替换。失败时活动 generation 不变；下载缓存可在 24 小时内续传。
+日频增量按数据集检查，只下载缺失的交易日期；交易日北京时间 17:00 起可纳入当天。显式使用 `--from`、`--repair-from` 或正数 `--lookback` 时才强制刷新区间。财务增量获取最近两个已结束季度，按记录的 `end_date` 重写对应报告年份。指数权重按整个 `(index_code, snapshot_date)` 快照替换。失败时活动 generation 不变；下载缓存可在 24 小时内续传。
 
 ## 原子发布
 
