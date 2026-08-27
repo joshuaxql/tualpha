@@ -196,6 +196,7 @@ uv run tualpha build --from 20100101
 
 ```bash
 uv run tualpha build --from 20100101 --to 20260825
+uv run tualpha build --from 20100101 --index-daily 399303.SZ --index-weight 399303.SZ
 uv run tualpha build --from 20100101 --index-weight 000016.SH
 uv run tualpha build --from 20100101 --dry-run --json
 ```
@@ -214,11 +215,14 @@ uv run tualpha update
 uv run tualpha update --from 20260801 --to 20260825
 uv run tualpha update --repair-from 20260701
 uv run tualpha update --lookback 20
+uv run tualpha update --index-daily 399303.SZ --index-weight 399303.SZ
 uv run tualpha update --index-weight 000016.SH
 uv run tualpha update --dry-run --json
 ```
 
 默认只下载各日频数据集缺失的交易日，不再重复刷新最近 10 个交易日。显式使用 `--from`、`--repair-from` 或 `--lookback N` 时，才会强制重下指定区间。交易日北京时间 17:00 起允许更新当日数据；17:00 前以及非交易日自动截止到最近已完成交易日。
+
+`--index-daily CODE` 用于定向回填非默认指数的日线历史；通常应与 `--index-weight CODE` 一起使用。已写入 Bundle 的指数会在后续普通更新中保留并随新交易日更新。
 
 财务增量固定获取最近两个已结束季度的报告：资产负债表、利润表、现金流量表和财务指标四个 VIP 接口各按季度调用两次，共 8 次请求。更新失败不会修改活动 generation；成功后从最终目录重新打开 Reader 验证。
 

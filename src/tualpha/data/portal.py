@@ -274,6 +274,7 @@ class BundleDataPortal:
             self._index_frames: OrderedDict[tuple[str, str], pd.DataFrame] = (
                 OrderedDict()
             )
+            self._position_prefetch_disabled = False
             asset_positions = pd.DataFrame(
                 {
                     "ts_code": tuple(self._code_position),
@@ -997,6 +998,8 @@ class BundleDataPortal:
         asset_list = list(assets)
         if not asset_list:
             return True
+        if self._position_prefetch_disabled:
+            return False
         requested = ["close", "pre_close"]
         cache_fields = [*requested]
         if self.adjustment is not AdjustmentMode.RAW:
@@ -1007,7 +1010,14 @@ class BundleDataPortal:
         )
         if required_bytes > self._column_cache_max_bytes:
             return False
-        self.prefetch(asset_list, requested)
+        try:
+            self.prefetch(asset_list, requested)
+        except MemoryError:
+            # Keep the run alive on memory-constrained machines. ``values()``
+            # will use bounded window queries for this large position basket.
+            self.clear_cache()
+            self._position_prefetch_disabled = True
+            return False
         return self._cache_has_fields(self._asset_positions(asset_list), cache_fields)
 
     def values(

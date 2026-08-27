@@ -38,6 +38,9 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--index-weight", action="append", default=[], metavar="INDEX_CODE"
     )
+    build.add_argument(
+        "--index-daily", action="append", default=[], metavar="INDEX_CODE"
+    )
     build.add_argument("--dry-run", action="store_true")
     build_progress = build.add_mutually_exclusive_group()
     build_progress.add_argument(
@@ -73,6 +76,9 @@ def _parser() -> argparse.ArgumentParser:
     update.add_argument("--token-stdin", action="store_true")
     update.add_argument(
         "--index-weight", action="append", default=[], metavar="INDEX_CODE"
+    )
+    update.add_argument(
+        "--index-daily", action="append", default=[], metavar="INDEX_CODE"
     )
     update.add_argument("--dry-run", action="store_true")
     progress = update.add_mutually_exclusive_group()
@@ -183,6 +189,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             full=is_build,
             compact=False if is_build else args.compact,
             show_progress=args.show_progress and not args.json_output,
+            index_daily_codes=tuple(args.index_daily),
             index_weight_codes=tuple(args.index_weight),
         )
         result = DataUpdater(options, token=token).run()

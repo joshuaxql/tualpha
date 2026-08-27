@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from pathlib import Path
 
 import pandas as pd
@@ -734,6 +735,28 @@ def test_engine_marks_portfolio_once_per_session(data_root: Path) -> None:
     algorithm.broker.mark_to_market = counted
     result = algorithm.run()
     assert calls == len(result.performance)
+
+
+def test_completed_algorithm_releases_raw_result_buffers(data_root: Path) -> None:
+    algorithm = TradingAlgorithm(
+        BacktestConfig(
+            start="2024-01-02",
+            end="2024-01-08",
+            bundle_root=data_root,
+            generate_report=False,
+            show_progress=False,
+        )
+    )
+
+    result = algorithm.run()
+
+    assert len(result.performance) == 5
+    assert len(result.daily_positions) == 5
+    assert algorithm._performance_rows == []
+    assert algorithm._record_rows == []
+    assert all(not values for values in algorithm._position_columns.values())
+    assert isinstance(algorithm._position_columns["quantity"], array)
+    assert result.daily_positions["quantity"].dtype == "float64"
 
 
 def test_adjustment_factor_reinvests_held_position(data_root: Path) -> None:

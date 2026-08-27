@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from array import array
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -58,6 +59,16 @@ _POSITION_COLUMNS = (
     "cash",
     "portfolio_value",
 )
+_POSITION_NUMERIC_COLUMNS = frozenset(_POSITION_COLUMNS[5:])
+
+
+def _empty_position_columns() -> dict[str, list[Any] | array]:
+    """Create compact buffers for the potentially large position history."""
+
+    return {
+        column: array("d") if column in _POSITION_NUMERIC_COLUMNS else []
+        for column in _POSITION_COLUMNS
+    }
 
 
 class AlgorithmContext:
@@ -136,9 +147,7 @@ class TradingAlgorithm:
         self._current_records: dict[str, Any] = {}
         self._record_rows: list[dict[str, Any]] = []
         self._performance_rows: list[dict[str, Any]] = []
-        self._position_columns: dict[str, list[Any]] = {
-            column: [] for column in _POSITION_COLUMNS
-        }
+        self._position_columns = _empty_position_columns()
 
     @property
     def portfolio_value(self) -> float:
@@ -729,13 +738,24 @@ class TradingAlgorithm:
 
         self.broker.cancel_remaining()
         self._phase = "finished"
-        performance = pd.DataFrame(self._performance_rows).set_index("date")
+        performance_rows, self._performance_rows = self._performance_rows, []
+        performance = pd.DataFrame(performance_rows).set_index("date")
+        performance_rows.clear()
         performance.index = pd.DatetimeIndex(performance.index, name="date")
-        positions = pd.DataFrame(self._position_columns, columns=_POSITION_COLUMNS)
+        position_columns, self._position_columns = (
+            self._position_columns,
+            _empty_position_columns(),
+        )
+        positions = pd.DataFrame(position_columns, columns=_POSITION_COLUMNS)
+        for values in position_columns.values():
+            del values[:]
+        position_columns.clear()
         orders = self._orders_frame(self.broker.orders)
         transactions = self._transactions_frame(self.broker.transactions)
         closed_trades = self._closed_trades_frame(self.broker.closed_trades)
-        records = pd.DataFrame(self._record_rows)
+        record_rows, self._record_rows = self._record_rows, []
+        records = pd.DataFrame(record_rows)
+        record_rows.clear()
         if not records.empty:
             records = records.set_index("date")
 

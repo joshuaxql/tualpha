@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
@@ -184,7 +185,10 @@ def _deduplicate(frame: pd.DataFrame, spec: TableSpec) -> pd.DataFrame:
 
 
 def _daily_incoming(
-    cache_path: Path, spec: TableSpec, etf_codes: set[str]
+    cache_path: Path,
+    spec: TableSpec,
+    etf_codes: set[str],
+    index_daily_codes: set[str],
 ) -> pd.DataFrame:
     if spec in {STOCK_DAILY, ETF_DAILY, INDEX_DAILY}:
         frame = _cache_frames(cache_path, "daily")
@@ -198,7 +202,7 @@ def _daily_incoming(
             ]
         elif spec is INDEX_DAILY:
             selected = selected[
-                selected["ts_code"].astype(str).str.upper().isin(INDEX_DAILY_CODES)
+                selected["ts_code"].astype(str).str.upper().isin(index_daily_codes)
             ]
         return selected
     if spec in {ADJ_FACTOR, ETF_ADJ_FACTOR}:
@@ -296,9 +300,32 @@ def _merge_index_weights(staged: Path, cache_path: Path, changed: set[str]) -> N
         changed.add(relative.as_posix())
 
 
-def _prune_index_daily(staged: Path, changed: set[str]) -> None:
+def _stored_index_daily_codes(staged: Path) -> set[str]:
     directory = staged / PARQUET_DIRECTORY / INDEX_DAILY.path
-    allowed = ", ".join(f"'{code}'" for code in INDEX_DAILY_CODES)
+    paths = sorted(directory.glob("year=*/data.parquet"))
+    if not paths:
+        return set()
+    connection = duckdb.connect()
+    try:
+        rows = connection.execute(
+            "SELECT DISTINCT upper(ts_code) FROM read_parquet(?, "
+            "hive_partitioning=true)",
+            [[str(path) for path in paths]],
+        ).fetchall()
+    finally:
+        connection.close()
+    return {str(row[0]) for row in rows}
+
+
+def _sql_code_list(codes: Sequence[str]) -> str:
+    return ", ".join(f"'{code.replace(chr(39), chr(39) * 2)}'" for code in codes)
+
+
+def _prune_index_daily(
+    staged: Path, changed: set[str], index_daily_codes: Sequence[str]
+) -> None:
+    directory = staged / PARQUET_DIRECTORY / INDEX_DAILY.path
+    allowed = _sql_code_list(index_daily_codes)
     columns = ", ".join(f'"{column}"' for column in INDEX_DAILY.column_names)
     for path in sorted(directory.glob("year=*/data.parquet")):
         connection = duckdb.connect()
@@ -329,10 +356,10 @@ def _prune_index_daily(staged: Path, changed: set[str]) -> None:
         changed.add(path.relative_to(staged).as_posix())
 
 
-def _validate_critical_data(staged: Path) -> None:
+def _validate_critical_data(staged: Path, index_daily_codes: Sequence[str]) -> None:
     pattern = staged / PARQUET_DIRECTORY / INDEX_WEIGHT.parquet_glob
     index_daily_pattern = staged / PARQUET_DIRECTORY / INDEX_DAILY.parquet_glob
-    allowed = ", ".join(f"'{code}'" for code in INDEX_DAILY_CODES)
+    allowed = _sql_code_list(index_daily_codes)
     connection = duckdb.connect()
     try:
         unexpected_indices = connection.execute(
@@ -366,6 +393,39 @@ def _validate_critical_data(staged: Path) -> None:
         )
 
 
+def _merge_requested_index_daily(
+    staged: Path, requested: pd.DataFrame, changed: set[str]
+) -> None:
+    if requested.empty:
+        return
+    incoming = requested.rename(columns={"vol": "volume", "amount": "turnover"})
+    incoming = incoming.copy()
+    incoming["turnover"] = pd.to_numeric(incoming["turnover"], errors="coerce") * 1000.0
+    incoming = normalize_frame(incoming, INDEX_DAILY)
+    for year, selected in incoming.groupby(
+        incoming["trade_date"].astype(str).str[:4], sort=True
+    ):
+        relative = parquet_relative_path(INDEX_DAILY, year=str(year))
+        path = staged / relative
+        active = _read_existing(path, INDEX_DAILY)
+        if not active.empty:
+            remove = pd.Series(False, index=active.index)
+            active_codes = active["ts_code"].astype(str).str.upper()
+            active_dates = active["trade_date"].astype(str)
+            for code, code_rows in selected.groupby(
+                selected["ts_code"].astype(str).str.upper(), sort=False
+            ):
+                first = str(code_rows["trade_date"].min())
+                last = str(code_rows["trade_date"].max())
+                remove |= active_codes.eq(str(code)) & active_dates.between(first, last)
+            active = active[~remove]
+        merged = _deduplicate(
+            pd.concat([active, selected], ignore_index=True, sort=False), INDEX_DAILY
+        )
+        write_parquet_atomic(merged, path, INDEX_DAILY)
+        changed.add(relative.as_posix())
+
+
 def _merge_calendar(
     staged: Path, update: pd.DataFrame, end_session: str
 ) -> pd.DataFrame:
@@ -392,6 +452,8 @@ def build_parquet_bundle(
     staging_root: str | Path,
     merge_active: bool = True,
     force_compact: bool = False,
+    index_daily_codes: Sequence[str] = INDEX_DAILY_CODES,
+    requested_index_daily: pd.DataFrame | None = None,
 ) -> ParquetBuild:
     del force_compact
     root = Path(bundle_root).expanduser()
@@ -409,8 +471,18 @@ def build_parquet_bundle(
     else:
         (staged / PARQUET_DIRECTORY).mkdir(parents=True, exist_ok=False)
 
+    allowed_index_daily_codes = tuple(
+        sorted(
+            {
+                *(str(code).upper() for code in index_daily_codes),
+                *_stored_index_daily_codes(staged),
+            }
+        )
+    )
+    if not allowed_index_daily_codes:
+        raise DataError("index_daily code allowlist cannot be empty")
     changed: set[str] = {CATALOG_FILE}
-    _prune_index_daily(staged, changed)
+    _prune_index_daily(staged, changed, allowed_index_daily_codes)
     write_parquet_atomic(
         stock, staged / parquet_relative_path(STOCK_BASIC), STOCK_BASIC
     )
@@ -464,14 +536,21 @@ def build_parquet_bundle(
         )
         if not spec_target_dates:
             continue
-        incoming = _daily_incoming(cache, spec, etf_codes)
+        incoming = _daily_incoming(
+            cache, spec, etf_codes, set(allowed_index_daily_codes)
+        )
         for year in sorted({date[:4] for date in spec_target_dates}):
             _replace_daily_year(
                 staged, spec, year, spec_target_dates, incoming, changed
             )
+    _merge_requested_index_daily(
+        staged,
+        requested_index_daily if requested_index_daily is not None else pd.DataFrame(),
+        changed,
+    )
     _merge_finance(staged, cache, changed)
     _merge_index_weights(staged, cache, changed)
-    _validate_critical_data(staged)
+    _validate_critical_data(staged, allowed_index_daily_codes)
 
     observations = daily_observations(staged)
     open_calendar = calendar[calendar["is_open"].astype(str).isin({"1", "1.0"})]

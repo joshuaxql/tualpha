@@ -21,6 +21,7 @@ uv run tualpha build --from YYYYMMDD [options]
 | `--to YYYYMMDD` | 可选结束日期，受完成交易日限制 |
 | `--bundle-root PATH` | 数据根目录，默认 `~/.tualpha` |
 | `--bundle-name NAME` | Bundle 名称，默认 `tualpha` |
+| `--index-daily CODE` | 追加指数日线并回填历史，可重复指定 |
 | `--index-weight CODE` | 追加指数权重，可重复指定 |
 | `--retries N` | API 请求重试次数，默认 3 |
 | `--backoff SECONDS` | 重试退避基数，默认 2 秒 |
@@ -35,6 +36,8 @@ uv run tualpha build --from YYYYMMDD [options]
 uv run tualpha build \
   --from 20100101 \
   --to 20260825 \
+  --index-daily 399303.SZ \
+  --index-weight 399303.SZ \
   --index-weight 000016.SH
 ```
 
@@ -54,6 +57,7 @@ uv run tualpha update [options]
 | `--lookback N` | 强制刷新最近 N 个交易日，默认 0 |
 | `--bundle-root PATH` | 数据根目录 |
 | `--bundle-name NAME` | Bundle 名称 |
+| `--index-daily CODE` | 定向回填指数日线，可重复指定 |
 | `--index-weight CODE` | 追加指数权重，可重复指定 |
 | `--retries N` | API 请求重试次数 |
 | `--backoff SECONDS` | 重试退避基数 |
@@ -63,10 +67,11 @@ uv run tualpha update [options]
 | `--json` | 输出 JSON |
 | `--compact` | 兼容参数；年度 Parquet 无需压缩 |
 
-默认仅下载各日频数据集缺失的日期。交易日北京时间 17:00 起可更新当天数据。
+默认仅下载各日频数据集缺失的日期。交易日北京时间 17:00 起可更新当天数据。新增非默认指数时，同时指定 `--index-daily CODE --index-weight CODE`；日线会从 Bundle 起始日或指数上市日回填。
 
 ```bash
 uv run tualpha update --dry-run --json
+uv run tualpha update --index-daily 399303.SZ --index-weight 399303.SZ
 ```
 
 JSON 示例：

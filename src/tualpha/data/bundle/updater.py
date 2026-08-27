@@ -39,7 +39,7 @@ from .parquet_writer import (
     find_active_bundle,
 )
 
-UPDATE_SCHEMA_VERSION = 7
+UPDATE_SCHEMA_VERSION = 8
 INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION = 1
 DEFAULT_INDEX_WEIGHT_CODES = (
     "000300.SH",
@@ -196,6 +196,7 @@ class UpdateOptions:
     full: bool = False
     compact: bool = False
     show_progress: bool = False
+    index_daily_codes: tuple[str, ...] = ()
     index_weight_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -212,15 +213,22 @@ class UpdateOptions:
             raise ConfigurationError("retries must be at least 1")
         if self.backoff < 0:
             raise ConfigurationError("backoff must be non-negative")
-        self.index_weight_codes = tuple(
-            dict.fromkeys(
-                code.strip().upper() for code in self.index_weight_codes if code.strip()
+        for field_name, label in (
+            ("index_daily_codes", "index daily"),
+            ("index_weight_codes", "index weight"),
+        ):
+            codes = tuple(
+                dict.fromkeys(
+                    code.strip().upper()
+                    for code in getattr(self, field_name)
+                    if code.strip()
+                )
             )
-        )
-        if any("." not in code for code in self.index_weight_codes):
-            raise ConfigurationError(
-                "index weight codes must include an exchange suffix"
-            )
+            if any("." not in code for code in codes):
+                raise ConfigurationError(
+                    f"{label} codes must include an exchange suffix"
+                )
+            setattr(self, field_name, codes)
         for value in (self.start, self.end, self.repair_from):
             if value is not None:
                 pd.to_datetime(value, format="%Y%m%d")
@@ -492,6 +500,106 @@ class DataUpdater:
         finally:
             connection.close()
 
+    def _active_index_daily_codes(self) -> set[str]:
+        active = find_active_bundle(self.options.bundle_root, self.options.bundle_name)
+        if active is None:
+            return set()
+        pattern = active / PARQUET_DIRECTORY / TABLE_SPECS["index_daily"].parquet_glob
+        connection = duckdb.connect()
+        try:
+            rows = connection.execute(
+                "SELECT DISTINCT upper(ts_code) FROM "
+                "read_parquet(?, hive_partitioning=true)",
+                [str(pattern)],
+            ).fetchall()
+        finally:
+            connection.close()
+        return {str(row[0]) for row in rows}
+
+    def _index_history_start(
+        self,
+        code: str,
+        active_sessions: pd.DatetimeIndex,
+        index_master: pd.DataFrame,
+    ) -> str:
+        if self.options.start:
+            start = self.options.start
+        elif len(active_sessions):
+            start = active_sessions[0].strftime("%Y%m%d")
+        else:
+            raise ConfigurationError(
+                "downloading an index history requires an explicit --from date"
+            )
+        if {"ts_code", "list_date"}.issubset(index_master.columns):
+            matches = index_master[
+                index_master["ts_code"].astype(str).str.upper().eq(code)
+            ]
+            if not matches.empty:
+                list_date = str(matches["list_date"].iloc[-1])
+                if len(list_date) == 8 and list_date.isdigit():
+                    start = max(start, list_date)
+        return start
+
+    def _download_requested_index_daily(
+        self,
+        writer: CsvUpdateWriter,
+        safe_end: str,
+        active_sessions: pd.DatetimeIndex,
+        index_master: pd.DataFrame,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for code in self.options.index_daily_codes:
+            start = self._index_history_start(code, active_sessions, index_master)
+            if start > safe_end:
+                raise DataError(
+                    f"index_daily history for {code} starts after {safe_end}"
+                )
+            partition = f"masters/index_daily_history/{code}/{start}-{safe_end}"
+            if writer.has_partition(partition):
+                frame = writer.read_raw_partition(partition)
+            else:
+                frame = self._fetch_paginated(
+                    "index_daily",
+                    {"ts_code": code, "start_date": start, "end_date": safe_end},
+                    6000,
+                )
+                writer.write_raw_partition(partition, frame)
+            if frame.empty:
+                raise DataError(
+                    f"index_daily returned no history for requested index {code}"
+                )
+            required = {
+                "ts_code",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "pre_close",
+                "vol",
+                "amount",
+            }
+            missing = required.difference(frame.columns)
+            if missing:
+                raise DataError(
+                    f"index_daily for {code} returned missing columns: {sorted(missing)}"
+                )
+            frame = frame.copy()
+            frame["ts_code"] = frame["ts_code"].astype(str).str.upper()
+            frame["trade_date"] = frame["trade_date"].astype(str)
+            returned_codes = set(frame["ts_code"])
+            if returned_codes != {code}:
+                raise DataError(
+                    f"index_daily for {code} returned unexpected codes: "
+                    f"{sorted(returned_codes)}"
+                )
+            if not frame["trade_date"].between(start, safe_end).all():
+                raise DataError(
+                    f"index_daily for {code} returned dates outside request"
+                )
+            frames.append(self._normalize_frame(frame, ["ts_code", "trade_date"]))
+        return _concat_frames(frames)
+
     def _forced_target_dates(
         self,
         open_dates: Sequence[str],
@@ -564,6 +672,7 @@ class DataUpdater:
         self,
         dates_by_dataset: dict[str, list[str]],
         writer: CsvUpdateWriter,
+        index_daily_codes: Sequence[str],
     ) -> None:
         date_sets = {dataset: set(dates) for dataset, dates in dates_by_dataset.items()}
         dates = sorted(set().union(*date_sets.values())) if date_sets else []
@@ -633,7 +742,7 @@ class DataUpdater:
                     writer.append_daily(frame, "etf", partition=partition)
                 elif spec.directory == "index_daily":
                     frame = frame[
-                        frame["ts_code"].astype(str).str.upper().isin(INDEX_DAILY_CODES)
+                        frame["ts_code"].astype(str).str.upper().isin(index_daily_codes)
                     ]
                     writer.append_daily(frame, "index", partition=partition)
                 elif spec.directory in {"adj_factor", "fund_adj"}:
@@ -835,6 +944,7 @@ class DataUpdater:
         safe_end: str,
         dates: Sequence[str],
         active_sessions: pd.DatetimeIndex,
+        index_master: pd.DataFrame,
     ) -> None:
         if self.options.full:
             existing_dates, coverage = {}, {}
@@ -868,10 +978,13 @@ class DataUpdater:
             position=1,
             disable=not self.options.show_progress,
         )
+        requested_codes = set(self.options.index_weight_codes)
         for code in index_codes:
             known_dates = existing_dates.get(code, set())
             covered = coverage_codes.get(code)
-            if (
+            if code in requested_codes and not known_dates:
+                start = self._index_history_start(code, active_sessions, index_master)
+            elif (
                 not known_dates
                 or not isinstance(covered, dict)
                 or str(covered.get("from", safe_end)) > history_start
@@ -941,6 +1054,16 @@ class DataUpdater:
                 "index_weight returned no historical snapshots for default indices: "
                 f"{missing_defaults}"
             )
+        missing_requested = [
+            code
+            for code in self.options.index_weight_codes
+            if not existing_dates.get(code)
+        ]
+        if missing_requested:
+            raise DataError(
+                "index_weight returned no historical snapshots for requested indices: "
+                f"{missing_requested}"
+            )
         writer.set_index_coverage(
             {
                 "schema_version": INDEX_WEIGHT_COVERAGE_SCHEMA_VERSION,
@@ -994,6 +1117,8 @@ class DataUpdater:
                 bool(status.get("compact")) == self.options.compact,
                 tuple(status.get("index_weight_codes", ()))
                 == self.options.index_weight_codes,
+                tuple(status.get("index_daily_codes", ()))
+                == self.options.index_daily_codes,
             )
         )
         cache_manifest = staging / "cache" / "cache-manifest.json"
@@ -1096,6 +1221,7 @@ class DataUpdater:
                 "dry_run": self.options.dry_run,
                 "full": self.options.full,
                 "compact": self.options.compact,
+                "index_daily_codes": list(self.options.index_daily_codes),
                 "index_weight_codes": list(self.options.index_weight_codes),
                 "resumed": resumable is not None,
             }
@@ -1149,6 +1275,25 @@ class DataUpdater:
                     dates_by_dataset = self._target_daily_dates(
                         masters.trade_cal, safe_end, active_sessions
                     )
+                    allowed_index_daily_codes = tuple(
+                        sorted(
+                            {
+                                *INDEX_DAILY_CODES,
+                                *self._active_index_daily_codes(),
+                                *self.options.index_daily_codes,
+                            }
+                        )
+                    )
+                    requested_index_daily = self._download_requested_index_daily(
+                        writer,
+                        safe_end,
+                        (
+                            pd.DatetimeIndex([])
+                            if self.options.full
+                            else active_sessions
+                        ),
+                        masters.index,
+                    )
                     dates = sorted(set().union(*map(set, dates_by_dataset.values())))
                     writer.set_target_dates(dates)
                     writer.set_target_dates_by_dataset(
@@ -1159,7 +1304,9 @@ class DataUpdater:
                         f"下载 {len(dates)} 个缺失交易日的日频数据",
                         refresh=True,
                     )
-                    self._download_daily_partitions(dates_by_dataset, writer)
+                    self._download_daily_partitions(
+                        dates_by_dataset, writer, allowed_index_daily_codes
+                    )
                     progress.update(1)
                     progress.set_postfix_str("下载 PIT 财务数据", refresh=True)
                     financial_full_start = full_start or (
@@ -1177,6 +1324,7 @@ class DataUpdater:
                             if self.options.full
                             else active_sessions
                         ),
+                        masters.index,
                     )
                     progress.update(1)
                     progress.set_postfix_str(
@@ -1243,6 +1391,8 @@ class DataUpdater:
                     "bundle_root": self.options.bundle_root,
                     "bundle_name": self.options.bundle_name,
                     "staging_root": staging,
+                    "index_daily_codes": allowed_index_daily_codes,
+                    "requested_index_daily": requested_index_daily,
                 }
                 direct = build_parquet_bundle(
                     cache_path,

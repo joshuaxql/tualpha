@@ -312,6 +312,32 @@ def test_position_data_preparation_warms_daily_valuation_columns(
     uncached.close()
 
 
+def test_position_data_preparation_falls_back_after_memory_error(
+    data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = list(finder)
+    portal = TushareDataPortal(data_root, finder, calendar, "qfq", "2024-01-08")
+    attempts = 0
+
+    def fail_prefetch(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        raise MemoryError("simulated cache allocation failure")
+
+    monkeypatch.setattr(portal, "prefetch", fail_prefetch)
+
+    assert not portal.prepare_position_data(assets)
+    assert portal._position_prefetch_disabled
+    assert not portal._column_cache
+    assert not portal.prepare_position_data(assets)
+    assert attempts == 1
+    portal.close()
+
+
 def test_duckdb_columns_are_loaded_once_and_cached(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)

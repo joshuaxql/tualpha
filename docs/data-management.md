@@ -46,6 +46,7 @@ uv run tualpha build --from 20100101
 
 ```bash
 uv run tualpha build --from 20100101 --to 20260825
+uv run tualpha build --from 20100101 --index-daily 399303.SZ --index-weight 399303.SZ
 uv run tualpha build --from 20100101 --index-weight 000016.SH
 uv run tualpha build --from 20200101 --dry-run --json
 ```
@@ -73,9 +74,11 @@ uv run tualpha update
 uv run tualpha update --from 20260801 --to 20260825
 uv run tualpha update --repair-from 20260701
 uv run tualpha update --lookback 20
+uv run tualpha update --index-daily 399303.SZ --index-weight 399303.SZ
 ```
 
 `--from`、`--repair-from` 和正数 `--lookback` 会强制刷新对应区间。
+`--index-daily CODE` 定向回填指定指数的日线历史，通常与 `--index-weight CODE` 配合使用；已下载的指数会在后续增量更新中保留。
 
 ### 当日可用时间
 

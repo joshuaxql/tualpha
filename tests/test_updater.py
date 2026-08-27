@@ -101,6 +101,23 @@ def test_update_cli_shows_progress_by_default(
     assert run_cli(["update", "--bundle-root", str(tmp_path), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == "test"
     assert received[-1].show_progress is False
+    assert (
+        run_cli(
+            [
+                "update",
+                "--bundle-root",
+                str(tmp_path),
+                "--index-daily",
+                "399303.sz",
+                "--index-weight",
+                "399303.sz",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert received[-1].index_daily_codes == ("399303.SZ",)
+    assert received[-1].index_weight_codes == ("399303.SZ",)
 
 
 def test_update_requires_token_without_injected_client(
@@ -403,6 +420,127 @@ def test_index_weight_refresh_keeps_other_indices(
             ).fetchall()
         }
     assert set(after) == set(before) == set(DEFAULT_INDEX_WEIGHT_CODES)
+
+
+def test_requested_index_history_and_weights_are_backfilled_and_preserved(
+    csv_dir: Path, tmp_path: Path
+) -> None:
+    class RequestedIndexClient(FakeProClient):
+        def query(self, api_name: str, **params: Any) -> pd.DataFrame:
+            if api_name == "index_daily" and params.get("ts_code") == "399303.SZ":
+                self.calls.append((api_name, dict(params)))
+                dates = ["20240102", "20240103", "20240104", "20240105", "20240108"]
+                frame = pd.DataFrame(
+                    [
+                        [
+                            "399303.SZ",
+                            date,
+                            5000 + offset,
+                            5010 + offset,
+                            4990 + offset,
+                            5005 + offset,
+                            5000 + offset,
+                            5,
+                            0.1,
+                            1000,
+                            2000,
+                        ]
+                        for offset, date in enumerate(dates)
+                    ],
+                    columns=[
+                        "ts_code",
+                        "trade_date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "pre_close",
+                        "change",
+                        "pct_chg",
+                        "vol",
+                        "amount",
+                    ],
+                )
+                frame = frame[
+                    frame["trade_date"].between(
+                        params["start_date"], params["end_date"]
+                    )
+                ]
+                start = int(params.get("offset", 0))
+                limit = int(params.get("limit", 6000))
+                return frame.iloc[start : start + limit].reset_index(drop=True)
+            if api_name == "index_weight" and params.get("index_code") == "399303.SZ":
+                self.calls.append((api_name, dict(params)))
+                frame = pd.DataFrame(
+                    [
+                        ["399303.SZ", "000001.SZ", "20240102", 60.0],
+                        ["399303.SZ", "688001.SH", "20240102", 40.0],
+                    ],
+                    columns=["index_code", "con_code", "trade_date", "weight"],
+                )
+                frame = frame[
+                    frame["trade_date"].between(
+                        params["start_date"], params["end_date"]
+                    )
+                ]
+                start = int(params.get("offset", 0))
+                limit = int(params.get("limit", 5000))
+                return frame.iloc[start : start + limit].reset_index(drop=True)
+            return super().query(api_name, **params)
+
+    root = tmp_path / "root"
+    _build(csv_dir, root)
+    client = RequestedIndexClient(csv_dir)
+    result = DataUpdater(
+        UpdateOptions(
+            bundle_root=root,
+            end="20240108",
+            retries=1,
+            show_progress=False,
+            index_daily_codes=("399303.sz",),
+            index_weight_codes=("399303.sz",),
+        ),
+        client=client,
+    ).run()
+
+    assert result.updated_dates == ()
+    history_calls = [
+        params
+        for name, params in client.calls
+        if name == "index_daily" and "ts_code" in params
+    ]
+    assert history_calls[0]["start_date"] == "20240102"
+    with local_data(root) as query:
+        assert (
+            query.sql(
+                "SELECT count(*) FROM index_daily WHERE ts_code='399303.SZ'"
+            ).iloc[0, 0]
+            == 5
+        )
+        assert (
+            query.sql(
+                "SELECT count(*) FROM index_daily WHERE ts_code='000985.CSI'"
+            ).iloc[0, 0]
+            == 5
+        )
+        assert (
+            query.sql(
+                "SELECT count(*) FROM index_weight WHERE index_code='399303.SZ'"
+            ).iloc[0, 0]
+            == 2
+        )
+
+    DataUpdater(
+        UpdateOptions(bundle_root=root, end="20240108", retries=1),
+        client=FakeProClient(csv_dir),
+    ).run()
+    with local_data(root) as query:
+        assert (
+            query.sql(
+                "SELECT count(*) FROM index_daily WHERE ts_code='399303.SZ'"
+            ).iloc[0, 0]
+            == 5
+        )
 
 
 def test_failed_build_keeps_active_generation_and_source(
