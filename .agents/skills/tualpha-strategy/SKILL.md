@@ -101,7 +101,7 @@ if __name__ == "__main__":
 - 大型横截面：`data.current_arrays()`；
 - 固定大型资产池：首次 `handle_data` 调用一次 `data.prefetch()`，不能在 `initialize()` 中调用；
 - 原始价格：仅确有需要时使用 `data.raw_current()`；
-- 财务：`data.fundamental()` / `data.fundamentals()`；
+- 财务：单资产使用 `data.fundamental()` / `data.fundamentals()`，大型横截面最新值使用 `data.fundamental_arrays()`；
 - 指数日线：`data.index_current()` / `data.index_history()`，始终为原始点位；
 - PIT 指数成分：`data.index_constituents()`；
 - 字段发现：`data.available_fields()`。
@@ -160,8 +160,8 @@ run_algorithm(
 
 ## 9. 性能规则
 
-- 固定大资产池使用 `current_arrays()`，不要逐资产调用 `current()`；
-- 首次回调用 `prefetch()` 预热后续会重复读取的字段；
+- 固定大资产池使用 `current_arrays()`，不要逐资产调用 `current()`；一次性批量查询会只扫描当前日期或请求窗口；
+- 仅当固定资产池和字段会在大量回调中重复使用时，首次回调用 `prefetch()` 建立全历史列缓存；`qfq` / `hfq` 价格会自动预取复权因子；
 - 固定资产位置、上市满期日期和常量数组在 `initialize()` 中预计算；
 - 避免每日创建不必要的大型 DataFrame；
 - 只在目标集合或策略信号变化时调仓；

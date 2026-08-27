@@ -144,7 +144,7 @@ history = data.index_history("000300.SH", ["close", "volume"], 20)
 
 ## 财务数据
 
-财务字段只能通过 `fundamental()` / `fundamentals()` 读取。
+财务字段只能通过 `fundamental()` / `fundamentals()` / `fundamental_arrays()` 读取。大型横截面的最新 PIT 财务值优先使用 `fundamental_arrays()`。
 
 ### 命名空间
 

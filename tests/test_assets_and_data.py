@@ -5,6 +5,7 @@ import shutil
 from importlib.util import find_spec
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -138,6 +139,139 @@ def test_vectorized_current_matches_scalar_values_and_uses_bounded_cache(
     portal.close()
 
 
+def test_bulk_current_and_history_use_window_queries_without_dense_cache(
+    data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = (list(finder) * 16)[:64]
+    portal = TushareDataPortal(data_root, finder, calendar, "qfq", "2024-01-08")
+    data = BarData(portal)
+    data._set_session("2024-01-04")
+
+    def fail_full_column(*args: object, **kwargs: object) -> object:
+        raise AssertionError("uncached window queries must not load full columns")
+
+    monkeypatch.setattr(portal, "_full_column", fail_full_column)
+    current = data.current_arrays(
+        assets,
+        ["close", "volume", "daily_basic.pe", "industry.l1_name"],
+    )
+    assert current["close"].shape == (len(assets),)
+    assert current["industry.l1_name"][0] == "银行"
+
+    history = data.history(assets, ["close", "volume"], 3)
+    assert history.shape == (3, len(assets) * 2)
+    assert np.isfinite(history.xs("close", axis=1, level="field").to_numpy()).any()
+    assert portal._column_cache_bytes == 0
+    portal.close()
+
+
+@pytest.mark.parametrize("adjustment", ["raw", "qfq", "hfq"])
+def test_window_query_history_matches_dense_cache(
+    data_root: Path,
+    adjustment: str,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = list(finder)
+    fields = [
+        "open",
+        "close",
+        "price",
+        "volume",
+        "turnover",
+        "up_limit",
+        "down_limit",
+        "adj_factor",
+        "suspended",
+        "daily_basic.pe",
+        "industry.l1_name",
+        "stock_st.is_st",
+    ]
+    cached_portal = TushareDataPortal(
+        data_root, finder, calendar, adjustment, "2024-01-08"
+    )
+    window_portal = TushareDataPortal(
+        data_root,
+        finder,
+        calendar,
+        adjustment,
+        "2024-01-08",
+        column_cache_max_bytes=0,
+    )
+    cached_data = BarData(cached_portal)
+    window_data = BarData(window_portal)
+    cached_data._set_session("2024-01-04")
+    window_data._set_session("2024-01-04")
+
+    expected = cached_data.history(assets, fields, 3)
+    actual = window_data.history(assets, fields, 3)
+
+    pd.testing.assert_frame_equal(actual, expected)
+    assert window_portal._column_cache_bytes == 0
+    cached_portal.close()
+    window_portal.close()
+
+
+def test_qfq_window_query_reuses_end_of_window_factors(
+    data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = list(finder)
+    portal = TushareDataPortal(
+        data_root,
+        finder,
+        calendar,
+        "qfq",
+        "2024-01-08",
+        column_cache_max_bytes=0,
+    )
+    sessions = calendar.window("2024-01-04", 3)
+    original = portal._direct_factor_matrix
+    calls = 0
+
+    def count_factor_reads(*args: object, **kwargs: object) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(portal, "_direct_factor_matrix", count_factor_reads)
+    adjustments = portal._direct_adjustment_matrix(assets, sessions, sessions[-1])
+
+    assert adjustments.shape == (3, len(assets))
+    assert calls == 1
+    portal.close()
+
+
+def test_prefetch_loads_adjustment_dependency_for_cached_history(
+    data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = list(finder)
+    portal = TushareDataPortal(data_root, finder, calendar, "qfq", "2024-01-08")
+    data = BarData(portal)
+    data._set_session("2024-01-04")
+
+    data.prefetch(assets, ["close", "volume"])
+    positions = portal._asset_positions(assets)
+    assert portal._loaded_positions["adj_factor.adj_factor"][positions].all()
+
+    def fail_window_query(*args: object, **kwargs: object) -> object:
+        raise AssertionError("prefetched history must use dense column cache")
+
+    monkeypatch.setattr(portal, "_direct_daily_matrices", fail_window_query)
+    history = data.history(assets, ["close", "volume"], 3)
+    assert history.shape == (3, len(assets) * 2)
+    assert history[("510300.SH", "close")].tolist() == pytest.approx([2.0, 2.0, 2.0])
+    portal.close()
+
+
 def test_duckdb_columns_are_loaded_once_and_cached(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)
@@ -224,6 +358,82 @@ def test_financial_queries_are_announcement_point_in_time(data_root: Path) -> No
     assert data.fundamentals(stock, "fina_indicator.roe", periods=2).iloc[0, 0] == 10.0
     with pytest.raises(KeyError, match="must be read with fundamental"):
         data.current(stock, "income.revenue")
+    income_cache = portal._finance_cache[(stock.sid, "income")]
+    assert set(income_cache.columns) == {
+        "effective_ann_date",
+        "end_date",
+        "report_type",
+        "update_flag",
+        "source_order",
+        "revenue",
+    }
+    portal.close()
+
+
+def test_financial_arrays_batch_latest_values_with_pit_rules(data_root: Path) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    stock = finder.retrieve_asset("000001.SZ")
+    assets = [
+        stock,
+        finder.retrieve_asset("688001.SH"),
+        stock,
+        finder.retrieve_asset("510300.SH"),
+    ]
+    fields = [
+        "fina_indicator.roe",
+        "income.revenue",
+        "balancesheet.total_assets",
+        "cashflow.n_cashflow_act",
+    ]
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+    data = BarData(portal)
+    data._set_session("2024-01-05")
+
+    arrays = data.fundamental_arrays(assets, fields)
+
+    expected_first = {
+        field: portal.fundamental(stock, "2024-01-05", field) for field in fields
+    }
+    for field in fields:
+        assert arrays[field][0] == expected_first[field]
+        assert pd.isna(arrays[field][1])
+        assert arrays[field][2] == expected_first[field]
+        assert pd.isna(arrays[field][3])
+        assert not arrays[field].flags.writeable
+    assert arrays["fina_indicator.roe"][0] == 11.0
+    assert arrays["income.revenue"][0] == 110.0
+    with pytest.raises(ValueError, match="read-only"):
+        arrays["income.revenue"][0] = 0.0
+    empty = data.fundamental_arrays([], fields)
+    assert all(values.shape == (0,) for values in empty.values())
+    assert all(not values.flags.writeable for values in empty.values())
+
+    data._set_session("2024-01-08")
+    revised = data.fundamental_arrays(assets, fields)
+    assert revised["fina_indicator.roe"][0] == 12.0
+    assert revised["income.revenue"][0] == 120.0
+    portal.close()
+
+
+def test_financial_arrays_respect_announcement_day_exclusion(
+    data_root: Path,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    stock = finder.retrieve_asset("000001.SZ")
+    portal = TushareDataPortal(data_root, finder, calendar, "raw", "2024-01-08")
+
+    hidden = portal.fundamental_arrays(
+        [stock], "2024-01-02", ["fina_indicator.roe", "income.revenue"]
+    )
+    assert pd.isna(hidden["fina_indicator.roe"][0])
+    assert pd.isna(hidden["income.revenue"][0])
+    visible = portal.fundamental_arrays(
+        [stock], "2024-01-03", ["fina_indicator.roe", "income.revenue"]
+    )
+    assert visible["fina_indicator.roe"][0] == 10.0
+    assert visible["income.revenue"][0] == 100.0
     portal.close()
 
 
@@ -236,8 +446,14 @@ def test_index_daily_is_readable_from_strategy_bar_data(data_root: Path) -> None
 
     assert data.index_current("000985.csi", "close") == 102.0
     assert data.index_current("000985.CSI", "price") == 102.0
+    assert portal._index_daily_frames["000985.CSI"].columns.tolist() == ["close"]
     current = data.index_current("000985.CSI", ["open", "close", "volume"])
     assert current.to_dict() == {"open": 102.0, "close": 102.0, "volume": 1000.0}
+    assert set(portal._index_daily_frames["000985.CSI"].columns) == {
+        "open",
+        "close",
+        "volume",
+    }
 
     history = data.index_history("000985.CSI", "close", 3)
     assert history.name == "000985.CSI"
@@ -280,6 +496,10 @@ def test_index_constituents_are_strictly_point_in_time(data_root: Path) -> None:
     assert list(before_visible.columns) == ["asset", "weight", "snapshot_date"]
 
     initial = portal.index_constituents("000300.SH", "2024-01-03")
+    assert portal._index_constituent_dates["000300.SH"] == (
+        "20240102",
+        "20240104",
+    )
     assert list(initial.index) == ["000001.SZ", "688001.SH"]
     assert initial["weight"].tolist() == [60.0, 40.0]
     assert initial.loc["000001.SZ", "asset"] == finder.retrieve_asset("000001.SZ")

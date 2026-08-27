@@ -137,7 +137,7 @@ if not context.prefetched:
     context.prefetched = True
 ```
 
-`prefetch()` 不返回数据，也不能在 `initialize()` 中调用。它只优化物理列加载，不改变回调可见日期。
+`prefetch()` 不返回数据，也不能在 `initialize()` 中调用。未预取的一次性批量查询只扫描当前日期或请求窗口；预取适用于会在大量回调中重复访问的固定资产池，会建立全历史稠密列缓存，并在 `qfq` / `hfq` 模式下自动加载价格字段依赖的复权因子。它只优化物理列加载，不改变回调可见日期。
 
 `current()` 返回形状：
 
@@ -210,8 +210,18 @@ reports = data.fundamentals(
 )
 ```
 
+大型横截面的最新可见值使用批量接口：
+
+```python
+arrays = data.fundamental_arrays(
+    assets,
+    ["fina_indicator.roe", "fina_indicator.q_netprofit_yoy"],
+)
+```
+
 - `fundamental` 返回 `float`，不可见或缺失时为 `NaN`；
 - `fundamentals` 返回以报告期 `end_date` 为索引的 `DataFrame`，最新报告期在前；
+- `fundamental_arrays` 按输入资产顺序返回字段到只读 NumPy 数组的映射，每张财务表只执行一次低内存批量 PIT 查询；
 - 财务字段不能通过 `current()` 或 `history()` 读取；
 - 默认只选择合并报表 `report_type="1"`；
 - `fina_indicator` 没有 report type 过滤。

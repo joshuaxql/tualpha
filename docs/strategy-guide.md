@@ -51,7 +51,7 @@ closes = data.history(etf, "close", 20)
 panel = data.history([stock, etf], ["close", "volume"], 60)
 ```
 
-大型固定资产池使用批量接口，并在首次回调预热：
+大型固定资产池必须使用批量接口。一次性 `current()` / `history()` 查询会自动只扫描当前日期或请求窗口；如果同一资产池和字段会在大量回调中重复使用，则在首次回调预热：
 
 ```python
 if not context.prefetched:
@@ -63,6 +63,8 @@ arrays = data.current_arrays(
     ["close", "volume", "daily_basic.total_mv"],
 )
 ```
+
+`prefetch()` 在 `qfq` / `hfq` 模式下会自动加载价格字段依赖的复权因子。预取会使用更多内存，但后续查询只做 NumPy 索引；不要对每日变化的临时资产池反复预取，也不要逐股票循环调用 `current()`，应使用 `current_arrays()`。
 
 数值参与筛选前必须检查 `numpy.isfinite()` 或 `pandas.notna()`。估值、收益和财务缺失值不能填 0 后参与排名。
 
@@ -107,7 +109,15 @@ reports = data.fundamentals(
     ["income.revenue", "balancesheet.total_assets"],
     periods=4,
 )
+
+# 大型横截面的最新 PIT 财务值；数组顺序与 stocks 一致。
+arrays = data.fundamental_arrays(
+    stocks,
+    ["fina_indicator.roe", "fina_indicator.q_netprofit_yoy"],
+)
 ```
+
+`fundamental_arrays()` 返回字段到只读 NumPy 数组的映射，并将同一财务表的横截面读取合并为一次查询。
 
 可见性规则：
 

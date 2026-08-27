@@ -196,6 +196,24 @@ class BarData:
             report_type=report_type,
         )
 
+    def fundamental_arrays(
+        self,
+        assets: Asset | Iterable[Asset],
+        fields: str | Iterable[str],
+        *,
+        report_type: str | None = "1",
+    ) -> dict[str, np.ndarray]:
+        """Return read-only arrays of latest callback-visible financial values."""
+
+        asset_list, _ = self._asset_list(assets)
+        field_list, _ = self._field_list(fields)
+        return self._portal.fundamental_arrays(
+            asset_list,
+            self.current_session,
+            field_list,
+            report_type=report_type,
+        )
+
     def index_current(
         self, index_code: str, fields: str | Iterable[str]
     ) -> float | pd.Series:
@@ -207,10 +225,11 @@ class BarData:
                 index_code, self.current_session, field_list[0]
             )
         return pd.Series(
-            {
-                field: self._portal.index_value(index_code, self.current_session, field)
-                for field in field_list
-            },
+            self._portal.index_values(
+                index_code,
+                self.current_session,
+                field_list,
+            ),
             name=index_code.upper().strip(),
             dtype=float,
         )
