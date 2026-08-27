@@ -14,8 +14,8 @@ import duckdb
 import pandas as pd
 from filelock import FileLock
 
-from ...config import DEFAULT_BUNDLE_ROOT
-from ...exceptions import DataError
+from ...foundation.config import DEFAULT_BUNDLE_ROOT
+from ...foundation.exceptions import DataError
 from .legacy_manifest import load_legacy_assets_manifest
 
 BUNDLE_NAME = "tualpha"

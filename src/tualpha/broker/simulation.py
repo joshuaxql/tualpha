@@ -10,7 +10,7 @@ import pandas as pd
 
 from ..data.portal import TushareDataPortal
 from ..data.trading_calendar import ChinaTradingCalendar
-from ..exceptions import DataError
+from ..foundation.exceptions import DataError
 from ..model.asset import Asset
 from ..model.order import (
     FeeBreakdown,

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 from .parquet_store import sha256_file
 from .schema import (
     DAILY_ROLES,

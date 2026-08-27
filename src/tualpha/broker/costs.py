@@ -8,7 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
-from ..config import normalize_session
+from ..foundation.config import normalize_session
 from ..model.asset import Asset, AssetType
 from ..model.order import FeeBreakdown
 

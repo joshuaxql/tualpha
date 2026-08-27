@@ -10,12 +10,12 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .. import __version__
-from ..config import DEFAULT_BUNDLE_ROOT
 from ..data.bundle.compactor import compact_bundle
 from ..data.bundle.parquet_schema import TABLE_SPECS
 from ..data.bundle.updater import DataUpdater, UpdateOptions, token_from_stdin
 from ..data.quality import QualityReporter, QualityRunner, format_summary
-from ..exceptions import TualphaError
+from ..foundation.config import DEFAULT_BUNDLE_ROOT
+from ..foundation.exceptions import TualphaError
 
 
 def _parser() -> argparse.ArgumentParser:

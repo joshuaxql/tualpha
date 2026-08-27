@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from typing import Any, Protocol
 
 from ..broker.costs import ChinaFeeModel
-from ..exceptions import NoActiveAlgorithm
+from ..foundation.exceptions import NoActiveAlgorithm
 from ..model.asset import Asset
 from ..model.order import Order
 

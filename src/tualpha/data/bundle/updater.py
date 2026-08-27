@@ -24,8 +24,8 @@ from tqdm.auto import tqdm
 # Avoid tqdm's monitor thread during long native DuckDB/Parquet operations on Windows.
 tqdm.monitor_interval = 0
 
-from ...config import DEFAULT_BUNDLE_ROOT
-from ...exceptions import ConfigurationError, DataError
+from ...foundation.config import DEFAULT_BUNDLE_ROOT
+from ...foundation.exceptions import ConfigurationError, DataError
 from ..tushare_fields import FINANCIAL_FIELDS
 from .calendar_store import normalize_trade_calendar
 from .csv_cache import CSV_CACHE_PROTOCOL, CsvUpdateWriter

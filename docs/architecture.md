@@ -5,6 +5,7 @@ TuAlpha 采用 RQAlpha 风格的职责分层，面向日频 A 股/ETF 回测，�
 ```text
 src/tualpha/
 ├── apis/                  # 策略函数，转发到 ExecutionContext
+├── foundation/            # 跨模块配置、枚举、日期规范化与异常体系
 ├── core/                  # TradingAlgorithm、回调阶段、D/D+1 事件循环
 ├── model/                 # Asset、Order、Transaction、Position、Portfolio
 ├── broker/                # SimulationBroker、Matcher、费用和市场规则
@@ -15,21 +16,25 @@ src/tualpha/
 │   ├── trading_calendar.py
 │   ├── quality/           # 表级质检和报告
 │   └── bundle/            # Parquet schema、全量构建、更新、Catalog 和发布
+├── analysis/              # BacktestResult 与无绘图依赖的绩效指标
+├── report/                # 图表、归因、格式化和 HTML 组装
 ├── cmds/                  # build / update / quality
-├── reporting.py
-├── metrics.py
-└── result.py
+└── *.py                   # 稳定公开导入路径的轻量兼容门面
 ```
+
+根目录模块只维护 `tualpha.config`、`tualpha.metrics`、`tualpha.reporting`
+等既有导入契约；框架内部必须依赖上述职责包中的唯一实现，避免门面层重复逻辑。
 
 ## 依赖方向
 
 ```text
 apis → core.execution_context
-core.algorithm → broker + data + model
+core.algorithm → foundation + broker + data + model + analysis
 broker → data.bar + model
 DataPortal → DuckDB query + model.asset + calendar
 bundle builder/updater → Parquet schema + Catalog + publication
 quality → DuckDB query + table registry
+report → analysis.result
 ```
 
 `model` 不依赖策略 API 或回测循环；`apis` 不直接操作 Broker；Matcher 不调用策略代码。
@@ -57,6 +62,7 @@ D+1
 - 同表多字段在一次窗口查询中读取，减少重复 Parquet 扫描；
 - 同日标量查询复用有界 snapshot cache，避免逐股票重复访问 DuckDB；
 - `prefetch()` 面向会在大量回调中重复使用的固定资产池，显式生成受内存上限约束的二维 NumPy 列缓存，并自动预取价格复权因子；
+- 框架对实际持仓的收盘价、昨收价和复权因子自动建立受同一内存上限约束的热缓存，避免逐日或逐股重复扫描 Parquet；
 - 宽历史结果通过 NumPy 堆叠一次构造 Pandas DataFrame，不再逐资产、逐字段插入列；
 - `fundamental_arrays()` 按财务表执行一次投影和 PIT 哈希聚合，单资产财务接口只加载请求字段并复用窄历史缓存；
 - 指数日线按请求字段增量缓存，多字段当前值只触发一次投影查询；指数成分只缓存快照日期和实际访问的 PIT 快照，不再加载全部历史成分行。

@@ -12,8 +12,8 @@ from uuid import uuid4
 
 import pandas as pd
 
-from ...config import DEFAULT_BUNDLE_ROOT
-from ...exceptions import DataError
+from ...foundation.config import DEFAULT_BUNDLE_ROOT
+from ...foundation.exceptions import DataError
 from . import parquet_store, registry
 from .parquet_store import load_manifest, validate_bundle
 

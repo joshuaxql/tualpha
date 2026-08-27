@@ -1,6 +1,7 @@
 """TuAlpha: a daily A-share stock and ETF backtesting framework."""
 
-from .api import (
+from .analysis.result import BacktestResult
+from .apis import (
     cancel_order,
     get_open_orders,
     order,
@@ -19,19 +20,23 @@ from .api import (
     set_commission,
     symbol,
 )
-from .assets import Asset, AssetFinder, AssetType, Board
-from .config import AdjustmentMode, BacktestConfig, ExecutionTime, PlotlyJsMode
-from .costs import ChinaFeeModel, RateSchedule
+from .broker.costs import ChinaFeeModel, RateSchedule
+from .core.algorithm import AlgorithmContext, TradingAlgorithm, run_algorithm
 from .data.query import LocalDataClient, local_data
-from .engine import AlgorithmContext, TradingAlgorithm, run_algorithm
-from .exceptions import (
+from .foundation.config import (
+    AdjustmentMode,
+    BacktestConfig,
+    ExecutionTime,
+    PlotlyJsMode,
+)
+from .foundation.exceptions import (
     ConfigurationError,
     DataError,
     NoActiveAlgorithm,
     SymbolNotFound,
     TualphaError,
 )
-from .models import (
+from .model import (
     Order,
     OrderSizing,
     OrderStatus,
@@ -39,7 +44,6 @@ from .models import (
     RejectReason,
     Transaction,
 )
-from .result import BacktestResult
 
 __all__ = [
     "AdjustmentMode",
@@ -88,7 +92,7 @@ __all__ = [
     "symbol",
 ]
 
-__version__ = "1.3.4"
+__version__ = "1.4.0"
 
 
 def main() -> None:

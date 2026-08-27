@@ -10,8 +10,8 @@ from typing import Self
 import duckdb
 import pandas as pd
 
-from ..config import DEFAULT_BUNDLE_ROOT
-from ..exceptions import DataError
+from ..foundation.config import DEFAULT_BUNDLE_ROOT
+from ..foundation.exceptions import DataError
 from .bundle.manager import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,

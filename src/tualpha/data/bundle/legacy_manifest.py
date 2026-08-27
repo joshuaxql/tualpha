@@ -6,7 +6,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 
 
 class _RestrictedUnpickler(pickle.Unpickler):

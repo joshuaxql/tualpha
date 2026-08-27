@@ -272,6 +272,46 @@ def test_prefetch_loads_adjustment_dependency_for_cached_history(
     portal.close()
 
 
+def test_position_data_preparation_warms_daily_valuation_columns(
+    data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finder = AssetFinder(data_root)
+    calendar = ChinaTradingCalendar(data_root)
+    assets = list(finder)
+    portal = TushareDataPortal(data_root, finder, calendar, "qfq", "2024-01-08")
+
+    assert portal.prepare_position_data(assets)
+    positions = portal._asset_positions(assets)
+    for key in ("daily.close", "daily.pre_close", "adj_factor.adj_factor"):
+        assert portal._loaded_positions[key][positions].all()
+
+    def fail_window_query(*args: object, **kwargs: object) -> object:
+        raise AssertionError("warmed position data must use the dense cache")
+
+    monkeypatch.setattr(portal, "_direct_daily_matrices", fail_window_query)
+    values = portal.values(
+        assets,
+        "2024-01-04",
+        ["close", "pre_close"],
+        reference_session="2024-01-08",
+    )
+    assert values["close"].shape == (len(assets),)
+    portal.close()
+
+    uncached = TushareDataPortal(
+        data_root,
+        finder,
+        calendar,
+        "qfq",
+        "2024-01-08",
+        column_cache_max_bytes=0,
+    )
+    assert not uncached.prepare_position_data(assets)
+    assert not uncached._column_cache
+    uncached.close()
+
+
 def test_duckdb_columns_are_loaded_once_and_cached(data_root: Path) -> None:
     finder = AssetFinder(data_root)
     calendar = ChinaTradingCalendar(data_root)

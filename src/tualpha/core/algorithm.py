@@ -14,26 +14,26 @@ from tqdm.auto import tqdm
 # Avoid a background monitor thread during native DuckDB/Parquet reads on Windows.
 tqdm.monitor_interval = 0
 
+from ..analysis.metrics import calculate_metrics
+from ..analysis.result import BacktestResult
 from ..broker.costs import ChinaFeeModel
 from ..broker.market_rules import ChinaMarketRules
 from ..broker.simulation import SimulationBroker
-from ..config import (
+from ..data.bar import BarData
+from ..data.bundle.manager import acquire_bundle_read_lock, release_bundle_read_lock
+from ..data.portal import BundleDataPortal
+from ..data.trading_calendar import ChinaTradingCalendar
+from ..foundation.config import (
     DEFAULT_BUNDLE_ROOT,
     AdjustmentMode,
     BacktestConfig,
     ExecutionTime,
     PlotlyJsMode,
 )
-from ..data.bar import BarData
-from ..data.bundle.manager import acquire_bundle_read_lock, release_bundle_read_lock
-from ..data.portal import BundleDataPortal
-from ..data.trading_calendar import ChinaTradingCalendar
-from ..exceptions import ConfigurationError, DataError, NoActiveAlgorithm
-from ..metrics import calculate_metrics
+from ..foundation.exceptions import ConfigurationError, DataError, NoActiveAlgorithm
 from ..model.asset import Asset, AssetFinder
 from ..model.order import Order, OrderSizing, Transaction
 from ..model.portfolio import ClosedTrade, Portfolio
-from ..result import BacktestResult
 from .execution_context import bind_algorithm
 
 Initialize = Callable[[Any], None]
@@ -493,6 +493,7 @@ class TradingAlgorithm:
             return
         position_assets = [asset for asset, _ in position_items]
         positions = [position for _, position in position_items]
+        self.data_portal.prepare_position_data(position_assets)
         position_prices = self.data_portal.values(
             position_assets,
             session,

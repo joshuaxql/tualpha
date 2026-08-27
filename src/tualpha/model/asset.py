@@ -10,7 +10,6 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from ..config import normalize_session
 from ..data.bundle.manager import (
     BUNDLE_NAME,
     acquire_bundle_read_lock,
@@ -18,7 +17,8 @@ from ..data.bundle.manager import (
     release_bundle_read_lock,
 )
 from ..data.bundle.parquet_store import CATALOG_FILE, load_manifest
-from ..exceptions import DataError, SymbolNotFound
+from ..foundation.config import normalize_session
+from ..foundation.exceptions import DataError, SymbolNotFound
 
 
 class AssetType(StrEnum):
@@ -88,7 +88,11 @@ def _asset_date(value: object) -> pd.Timestamp | None:
     if numeric <= 0:
         return None
     try:
-        return pd.to_datetime(str(numeric), format="%Y%m%d").normalize()
+        return pd.Timestamp(
+            year=numeric // 10_000,
+            month=(numeric // 100) % 100,
+            day=numeric % 100,
+        )
     except ValueError as exc:
         raise DataError(f"assets.pk contains an invalid asset date: {value}") from exc
 

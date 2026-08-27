@@ -15,7 +15,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 from .parquet_schema import TABLE_SPECS, TableSpec
 
 BUNDLE_PROTOCOL = "tualpha.parquet/1"

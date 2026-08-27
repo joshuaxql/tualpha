@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..exceptions import DataError
+from ..foundation.exceptions import DataError
 from .bundle.calendar_store import SessionCalendar, load_bundle_calendar
 from .bundle.manager import (
     BUNDLE_NAME,

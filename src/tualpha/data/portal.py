@@ -13,8 +13,8 @@ from typing import Any, Self
 import numpy as np
 import pandas as pd
 
-from ..config import AdjustmentMode, normalize_session
-from ..exceptions import DataError
+from ..foundation.config import AdjustmentMode, normalize_session
+from ..foundation.exceptions import DataError
 from ..model.asset import Asset, AssetFinder
 from .bundle.manager import (
     BUNDLE_NAME,
@@ -450,6 +450,15 @@ class BundleDataPortal:
             self._column_cache_bytes += values.nbytes
         return values
 
+    def _dense_column_nbytes(self, role: str, field: str) -> int:
+        flag = (role, field) in {
+            ("stock_st", "is_st"),
+            ("suspend_d", "suspended"),
+        }
+        dtype = np.uint8 if flag else np.float64 if role == "daily" else np.float32
+        itemsize = np.dtype(dtype).itemsize
+        return len(self._sessions) * len(self._ordered_assets) * itemsize
+
     def _field_query(self, role: str, field: str) -> tuple[str, list[object]]:
         tables = _DAILY_TABLES[role]
         if role == "suspend_d" and field == "suspended":
@@ -716,10 +725,13 @@ class BundleDataPortal:
                     ("stock_st", "is_st"),
                     ("suspend_d", "suspended"),
                 }
+                dtype = (
+                    np.uint8 if flag else np.float64 if role == "daily" else np.float32
+                )
                 cached = np.full(
                     (len(self._sessions), len(self._ordered_assets)),
                     0 if flag else np.nan,
-                    dtype=np.uint8 if flag else np.float32,
+                    dtype=dtype,
                 )
             self._loaded_positions[key] = np.zeros(
                 len(self._ordered_assets), dtype=bool
@@ -820,7 +832,17 @@ class BundleDataPortal:
         dates, factors = self._factor_series(asset.sid)
         if not len(dates):
             return 1.0
-        date = normalize_session(session)
+        date = (
+            session
+            if isinstance(session, pd.Timestamp)
+            and session.tzinfo is None
+            and session.hour == 0
+            and session.minute == 0
+            and session.second == 0
+            and session.microsecond == 0
+            and session.nanosecond == 0
+            else normalize_session(session)
+        )
         value = date.year * 10_000 + date.month * 100 + date.day
         index = int(np.searchsorted(dates, value, side="right") - 1)
         return float(factors[index]) if index >= 0 else 1.0
@@ -968,6 +990,25 @@ class BundleDataPortal:
                 raise KeyError(f"unknown daily bar field: {field}")
             role, column = _BASE_STORAGE[field]
             self._full_column(role, column, load_positions)
+
+    def prepare_position_data(self, assets: Sequence[Asset]) -> bool:
+        """Warm bounded columns reused by daily valuation and position capture."""
+
+        asset_list = list(assets)
+        if not asset_list:
+            return True
+        requested = ["close", "pre_close"]
+        cache_fields = [*requested]
+        if self.adjustment is not AdjustmentMode.RAW:
+            cache_fields.append("adj_factor")
+        physical = {_BASE_STORAGE[field] for field in cache_fields}
+        required_bytes = sum(
+            self._dense_column_nbytes(role, column) for role, column in physical
+        )
+        if required_bytes > self._column_cache_max_bytes:
+            return False
+        self.prefetch(asset_list, requested)
+        return self._cache_has_fields(self._asset_positions(asset_list), cache_fields)
 
     def values(
         self,
@@ -1625,6 +1666,7 @@ class BundleDataPortal:
                 "WHERE index_code = ? AND trade_date = ? ORDER BY con_code",
                 [code, snapshot],
             ).fetchall()
+            snapshot_date = pd.to_datetime(snapshot, format="%Y%m%d")
             rows = []
             for con_code, weight in selected:
                 try:
@@ -1636,7 +1678,7 @@ class BundleDataPortal:
                         "ts_code": str(con_code),
                         "asset": asset,
                         "weight": float(weight),
-                        "snapshot_date": pd.to_datetime(snapshot, format="%Y%m%d"),
+                        "snapshot_date": snapshot_date,
                     }
                 )
             cached = pd.DataFrame(rows).set_index("ts_code")[
@@ -1645,7 +1687,7 @@ class BundleDataPortal:
             cached.attrs.update(
                 {
                     "index_code": code,
-                    "snapshot_date": pd.to_datetime(snapshot, format="%Y%m%d"),
+                    "snapshot_date": snapshot_date,
                     "weight_unit": "percent",
                 }
             )

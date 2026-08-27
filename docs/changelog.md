@@ -1,5 +1,13 @@
 # 版本记录
 
+## 1.4.0
+
+- DataPortal 自动为实际持仓预热收盘价、昨收价和复权因子，完整中证 1000 性能基准吞吐量提升约 9 倍；
+- 日线缓存保留双精度，并继续遵守 D/D+1、T+1、涨跌停、停牌、费用和 PIT 可见性规则；
+- 将配置与异常、绩效结果以及报告生成分别迁入 `foundation/`、`analysis/` 和 `report/` 职责包；
+- 根目录模块改为轻量兼容门面，既有 `tualpha.config`、`tualpha.metrics`、`tualpha.reporting` 等导入路径保持可用；
+- 拆分报告的图表、归因、格式化和 HTML 组装逻辑，并增加模块边界兼容测试。
+
 ## 1.3.4
 
 - 新增 `data.fundamental_arrays()`，用每张财务表一次查询批量读取大型横截面的最新 PIT 财务值；
@@ -45,6 +53,7 @@
 
 | TuAlpha | Python | Pandas | 存储 |
 |---|---:|---:|---|
+| 1.4.0 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.4 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.3 | 3.12+ | 3.0+ | Parquet + DuckDB |
 | 1.3.2 | 3.12+ | 3.0+ | Parquet + DuckDB |

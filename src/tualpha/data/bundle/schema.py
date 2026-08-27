@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 from ..tushare_fields import FINANCIAL_FIELDS
 
 

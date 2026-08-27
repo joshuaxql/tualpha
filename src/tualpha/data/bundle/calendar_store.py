@@ -9,7 +9,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 from .parquet_store import CATALOG_FILE, load_manifest
 
 CALENDAR_NAME = "XSHG"

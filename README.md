@@ -324,7 +324,7 @@ uv run mkdocs build --strict
 当前测试基线：
 
 ```text
-94 passed
+106 passed
 ```
 
 ## 支持边界

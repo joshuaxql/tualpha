@@ -13,7 +13,7 @@ import duckdb
 import pandas as pd
 from filelock import FileLock
 
-from ...exceptions import DataError
+from ...foundation.exceptions import DataError
 from .catalog_builder import build_asset_table, daily_observations, datasets_frame
 from .manager import BUNDLE_NAME, bundle_lock_path, bundle_path, publish_fixed_bundle
 from .parquet_schema import (

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from ...config import DEFAULT_BUNDLE_ROOT
+from ...foundation.config import DEFAULT_BUNDLE_ROOT
 from ..bundle.manager import BUNDLE_NAME
 from ..bundle.parquet_schema import (
     ADJ_FACTOR,
