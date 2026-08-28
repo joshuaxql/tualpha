@@ -12,12 +12,14 @@ src/tualpha/
 ├── data/
 │   ├── bar.py             # DailyBar 与回调 BarData
 │   ├── portal.py          # PIT Parquet DataPortal 与 NumPy 列缓存
+│   ├── factors.py         # 安全表达式 AST、窗口规划与向量化算子
+│   ├── research.py        # 离线 FactorData、PIT 资产池和过滤
 │   ├── query.py           # DuckDB 本地查询客户端
 │   ├── trading_calendar.py
 │   ├── quality/           # 表级质检和报告
 │   └── bundle/            # Parquet schema、全量构建、更新、Catalog 和发布
-├── analysis/              # BacktestResult 与无绘图依赖的绩效指标
-├── report/                # 图表、归因、格式化和 HTML 组装
+├── analysis/              # 回测结果、绩效指标和 IC/RankIC 因子分析
+├── report/                # 回测/因子图表、归因、格式化和 HTML 组装
 ├── cmds/                  # build / update / quality
 └── *.py                   # 稳定公开导入路径的轻量兼容门面
 ```
@@ -64,6 +66,8 @@ D+1
 - `prefetch()` 面向会在大量回调中重复使用的固定资产池，显式生成受内存上限约束的二维 NumPy 列缓存，并自动预取价格复权因子；
 - 框架对实际持仓的收盘价、昨收价和复权因子自动建立受同一内存上限约束的热缓存，避免逐日或逐股重复扫描 Parquet；
 - 宽历史结果通过 NumPy 堆叠一次构造 Pandas DataFrame，不再逐资产、逐字段插入列；
+- 因子编译器先提取所有物理字段与最大前后窗口，一次加载共享矩阵；同批表达式复用 AST 子表达式缓存，截面与时序算子均按二维数组向量化；
+- `FactorData` 对指数历史成分生成严格 `snapshot_date < D` 的布尔掩码，并在同一掩码上应用历史 ST、上市天数和停牌过滤；全算子长区间基准采用列预取和小批输出控制峰值内存；
 - `fundamental_arrays()` 按财务表执行一次投影和 PIT 哈希聚合，单资产财务接口只加载请求字段并复用窄历史缓存；
 - 指数日线按请求字段增量缓存，多字段当前值只触发一次投影查询；指数成分只缓存快照日期和实际访问的 PIT 快照，不再加载全部历史成分行。
 

@@ -35,7 +35,7 @@ TuAlpha 是面向 A 股股票和 ETF 的事件驱动回测框架。策略在交�
   </div>
   <div class="ta-card">
     <h3>可解释结果</h3>
-    <p>输出绩效、订单、成交、持仓、已平仓交易、费用、拒单原因、归因和中文 Plotly HTML 报告。</p>
+    <p>输出回测绩效与归因，也可计算 IC、RankIC、分位收益并生成中文 Plotly 因子报告。</p>
   </div>
 </div>
 
@@ -81,6 +81,7 @@ result = run_algorithm(
 
 - [快速开始](getting-started.md)：安装、数据准备和第一次运行；
 - [策略开发](strategy-guide.md)：D/D+1、订单、行情、PIT 和性能规则；
+- [因子研究](factor-research.md)：表达式算子、PIT 资产池、IC/RankIC 与报告；
 - [数据管理](data-management.md)：全量构建、增量更新、查询与质检；
 - [架构说明](architecture.md)：核心模块、事件循环和发布路径；
 - [Bundle 格式](bundle-format.md)：物理分区、Catalog、manifest 和完整性协议。

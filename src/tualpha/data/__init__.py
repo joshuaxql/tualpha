@@ -9,7 +9,9 @@ __all__ = [
     "BundleDataPortal",
     "ChinaTradingCalendar",
     "DailyBar",
+    "FactorData",
     "TushareDataPortal",
+    "factor_data",
 ]
 
 
@@ -29,4 +31,8 @@ def __getattr__(name: str) -> Any:
         from .trading_calendar import ChinaTradingCalendar
 
         return ChinaTradingCalendar
+    if name in {"FactorData", "factor_data"}:
+        from .research import FactorData, factor_data
+
+        return {"FactorData": FactorData, "factor_data": factor_data}[name]
     raise AttributeError(name)

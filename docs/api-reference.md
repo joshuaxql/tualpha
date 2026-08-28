@@ -81,6 +81,20 @@ history = data.index_history("000300.SH", ["close", "volume"], 20)
 
 ::: tualpha.data.query.LocalDataClient
 
+## 因子研究
+
+::: tualpha.data.research.factor_data
+
+::: tualpha.data.research.FactorData
+
+::: tualpha.analysis.factor.run_factor_analysis
+
+::: tualpha.analysis.factor.analyze_factor_data
+
+::: tualpha.analysis.factor.neutralize_factor_values
+
+::: tualpha.analysis.factor.FactorAnalysisResult
+
 ## 回测结果
 
 ::: tualpha.result.BacktestResult

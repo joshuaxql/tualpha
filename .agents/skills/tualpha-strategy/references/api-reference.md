@@ -163,6 +163,18 @@ prices = data.history(assets, "close", 60)
 panel = data.history(assets, ["close", "daily_basic.pe_ttm"], 60)
 ```
 
+历史字段可以混合因子表达式：
+
+```python
+factors = data.history(
+    assets,
+    ["RANK($close/$open)", "1/$daily_basic.total_mv"],
+    60,
+)
+```
+
+截面算子按每个交易日的传入资产列表计算，时序算子会自动在返回窗口之前加载 warm-up 交易日。表达式仍只能读取截至当前 D 日的数据；`FUTURE_RETURNS` 仅供离线因子分析生成标签，禁止用于回调信号。`data.available_operators()` 返回支持的算子名称。
+
 返回形状：
 
 | 输入 | 返回 |
@@ -173,6 +185,8 @@ panel = data.history(assets, ["close", "daily_basic.pe_ttm"], 60)
 | 多资产、多字段 | 日期索引、`(asset, field)` 多级列 `DataFrame` |
 
 窗口包含当前回调日。如果回测刚开始，返回长度可能不足 `bar_count`，策略必须先检查长度和有效观测数。
+
+离线研究使用顶层 `factor_data()` 创建固定日期范围和 PIT 资产池，然后可直接调用 `data.history([表达式, ...])`。IC、RankIC、分位收益和报告使用 `run_factor_analysis()`；`periods=[1, 5, 10]` 接受正整数数组，报告会为每个周期生成多空、分位组合和信息分析；每份 HTML 只对应一个因子并显示其完整表达式。`industry_neutral=True` 使用当日 PIT 申万一级行业固定效应，`market_cap_neutral=True` 使用当日对数总市值，两者联合开启时做联合残差化。离线未来收益标签不会暴露给策略回调。
 
 ## 财务数据
 

@@ -1,5 +1,11 @@
 """TuAlpha: a daily A-share stock and ETF backtesting framework."""
 
+from .analysis.factor import (
+    FactorAnalysisResult,
+    analyze_factor_data,
+    neutralize_factor_values,
+    run_factor_analysis,
+)
 from .analysis.result import BacktestResult
 from .apis import (
     cancel_order,
@@ -23,6 +29,7 @@ from .apis import (
 from .broker.costs import ChinaFeeModel, RateSchedule
 from .core.algorithm import AlgorithmContext, TradingAlgorithm, run_algorithm
 from .data.query import LocalDataClient, local_data
+from .data.research import FactorData, factor_data
 from .foundation.config import (
     AdjustmentMode,
     BacktestConfig,
@@ -58,6 +65,8 @@ __all__ = [
     "ConfigurationError",
     "DataError",
     "ExecutionTime",
+    "FactorAnalysisResult",
+    "FactorData",
     "LocalDataClient",
     "NoActiveAlgorithm",
     "Order",
@@ -71,9 +80,12 @@ __all__ = [
     "TradingAlgorithm",
     "Transaction",
     "TualphaError",
+    "analyze_factor_data",
     "cancel_order",
+    "factor_data",
     "get_open_orders",
     "local_data",
+    "neutralize_factor_values",
     "order",
     "order_many",
     "order_percent",
@@ -88,11 +100,12 @@ __all__ = [
     "order_value_many",
     "record",
     "run_algorithm",
+    "run_factor_analysis",
     "set_commission",
     "symbol",
 ]
 
-__version__ = "1.4.1"
+__version__ = "2.0.0"
 
 
 def main() -> None:

@@ -1,5 +1,37 @@
 # 国证 2000 指数增强性能策略
 
+## 中证 1000 复杂因子分析基准
+
+`csi1000_complex_factor_analysis.py` 使用价量、动量、波动和市值组合成一个最大回看 79 个交易日的复杂因子，并生成包含 1、5、10 日预测周期的完整因子报告：
+
+```text
+RANK(0.30*TS_ZSCORE(RETURNS($close,20),60)
+     -0.25*TS_ZSCORE(STD(RETURNS($close,1),20),60)
+     +0.20*TS_ZSCORE($volume/MA($volume,20),20)
+     -0.15*TS_ZSCORE(ATR($close,14)/$close,60)
+     +0.10*RANK(1/$daily_basic.total_mv))
+```
+
+默认使用 2017-01-01 至 2026-01-01 的 PIT 中证 1000 成分、前复权价格，剔除 ST、上市不足 365 天和停牌股票，并进行行业与市值联合中性化：
+
+```bash
+uv run python performance/csi1000_complex_factor_analysis.py --label after
+```
+
+基准分别记录数据初始化、字段加载与表达式求值、因子统计、CSV 导出、HTML 导出及总耗时。结果写入 `outputs/performance/csi1000_complex_factor/benchmark_<label>.json`；同时存在 `benchmark_before.json` 时，`--label after` 还会生成 `stage_comparison.csv`。报告默认写入 `outputs/factor_reports/csi1000_complex_factor/`。
+
+## 中证 1000 全算子因子基准
+
+`csi1000_factor_benchmark.py` 覆盖 `算子.md` 中列出的全部基础与技术算子。默认计算区间为 2017-01-01 至 2026-01-01，资产池使用 `snapshot_date < D` 的中证 1000（`000852.SH`）历史成分，并在每个信号日剔除 ST、上市不足 365 天和停牌股票。
+
+```bash
+uv run python performance/csi1000_factor_benchmark.py
+```
+
+脚本先预取所有算子共享的物理字段，再按小批次计算，避免一次保留约百个完整因子矩阵。默认结果写入 `outputs/performance/csi1000_factors/benchmark.json`，其中包含总耗时、吞吐量、有效值数、校验和及各批次耗时。可使用 `--batch-size`、`--column-cache-mib`、`--no-prefetch` 和 Bundle 参数固定对比条件。
+
+---
+
 本目录提供一套可重复运行的 TuAlpha 大横截面性能基准。策略文件为 `guozheng2000_enhanced.py`，目的在于同时覆盖 PIT 指数成分、批量日线、批量财务查询、组合构建和大批量下单；回测结果不构成投资建议。
 
 ## 策略逻辑

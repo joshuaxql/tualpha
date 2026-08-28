@@ -23,6 +23,7 @@ nav:
   - 首页: index.md
   - 快速开始: getting-started.md
   - 策略开发: strategy-guide.md
+  - 因子研究: factor-research.md
   - 数据管理: data-management.md
   - API 参考: api-reference.md
   - CLI 参考: cli-reference.md

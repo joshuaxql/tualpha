@@ -24,6 +24,12 @@ from .bundle.manager import (
 )
 from .bundle.parquet_schema import FINANCE_SPECS
 from .bundle.parquet_store import load_manifest
+from .factors import (
+    available_operators,
+    compile_expression,
+    evaluate_expressions,
+    is_factor_expression,
+)
 from .query import LocalDataClient
 from .trading_calendar import ChinaTradingCalendar
 
@@ -1113,7 +1119,7 @@ class BundleDataPortal:
             output[field] = result
         return output
 
-    def history(
+    def _daily_history(
         self,
         assets: Sequence[Asset],
         fields: Sequence[str],
@@ -1121,10 +1127,16 @@ class BundleDataPortal:
         bar_count: int,
         *,
         adjusted: bool = True,
+        adjustment_reference_session: str | pd.Timestamp | None = None,
     ) -> pd.DataFrame:
         asset_list = list(assets)
         field_list = list(fields)
         sessions = self.calendar.window(end_session, bar_count, include_end=True)
+        adjustment_reference = (
+            end_session
+            if adjustment_reference_session is None
+            else adjustment_reference_session
+        )
         asset_positions = self._asset_positions(asset_list)
         needs_adjustment = (
             adjusted
@@ -1145,7 +1157,9 @@ class BundleDataPortal:
             matrices = self._direct_daily_matrices(asset_list, sessions, field_list)
             if needs_adjustment:
                 direct_adjustments = self._direct_adjustment_matrix(
-                    asset_list, sessions, end_session
+                    asset_list,
+                    sessions,
+                    adjustment_reference,
                 )
                 for field in field_list:
                     if field in _ADJUSTED_PRICE_FIELDS:
@@ -1157,7 +1171,11 @@ class BundleDataPortal:
         )
         alive = self._alive(asset_positions, sessions)
         adjustments = (
-            self._adjustment_matrix(asset_list, sessions, end_session)
+            self._adjustment_matrix(
+                asset_list,
+                sessions,
+                adjustment_reference,
+            )
             if needs_adjustment
             else None
         )
@@ -1209,6 +1227,140 @@ class BundleDataPortal:
                     matrix[rows, cols] *= adjustments[rows, cols]
             matrices[field] = matrix
         return self._history_frame(asset_list, field_list, sessions, matrices)
+
+    def factor_history(
+        self,
+        assets: Sequence[Asset],
+        fields: Sequence[str],
+        start_session: str | pd.Timestamp,
+        end_session: str | pd.Timestamp,
+        *,
+        adjusted: bool = True,
+        allow_future: bool = False,
+    ) -> pd.DataFrame:
+        """Return raw fields and factor expressions over an explicit date range.
+
+        Extra source sessions needed by nested rolling operators are loaded before
+        ``start_session``.  Future sessions are loaded only when ``allow_future``
+        is explicitly enabled by the offline research API; callback history never
+        enables it.
+        """
+
+        asset_list = list(assets)
+        names = list(fields)
+        if not names:
+            requested_sessions = self.calendar.sessions_in_range(
+                start_session, end_session
+            )
+            columns = pd.MultiIndex.from_arrays([[], []], names=["asset", "field"])
+            return pd.DataFrame(index=requested_sessions, columns=columns)
+        start = normalize_session(start_session)
+        end = normalize_session(end_session)
+        if start > end:
+            raise ValueError("factor history start must not be after end")
+        if end > self.backtest_end:
+            raise DataError("factor history query cannot exceed backtest end")
+        requested_sessions = self.calendar.sessions_in_range(start, end)
+        if requested_sessions.empty:
+            columns = pd.MultiIndex.from_product(
+                [[asset.ts_code for asset in asset_list], names],
+                names=["asset", "field"],
+            )
+            return pd.DataFrame(index=requested_sessions, columns=columns)
+
+        expressions = [name for name in names if is_factor_expression(name)]
+        compiled = [compile_expression(expression) for expression in expressions]
+        raw_fields = list(
+            dict.fromkeys(
+                [
+                    *(name for name in names if name not in expressions),
+                    *(field for expression in compiled for field in expression.fields),
+                ]
+            )
+        )
+        for field in raw_fields:
+            _, _, kind = self._daily_field_details(field)
+            if (
+                field
+                in {
+                    dependency
+                    for expression in compiled
+                    for dependency in expression.fields
+                }
+                and kind == "categorical"
+            ):
+                raise TypeError(
+                    f"categorical field {field!r} cannot be used in a factor expression"
+                )
+
+        first = int(self._sessions.searchsorted(requested_sessions[0]))
+        last = int(self._sessions.searchsorted(requested_sessions[-1]))
+        lookback = max((expression.lookback for expression in compiled), default=0)
+        lookahead = (
+            max((expression.lookahead for expression in compiled), default=0)
+            if allow_future
+            else 0
+        )
+        source_first = max(0, first - lookback)
+        source_last = min(len(self._sessions) - 1, last + lookahead)
+        source_sessions = self._sessions[source_first : source_last + 1]
+        raw = self._daily_history(
+            asset_list,
+            raw_fields,
+            source_sessions[-1],
+            len(source_sessions),
+            adjusted=adjusted,
+            adjustment_reference_session=requested_sessions[-1],
+        )
+        codes = [asset.ts_code for asset in asset_list]
+        inputs = {
+            field: raw.xs(field, axis=1, level="field").reindex(columns=codes)
+            for field in raw_fields
+        }
+        calculated = evaluate_expressions(expressions, inputs) if expressions else {}
+        matrices: dict[str, np.ndarray] = {}
+        for name in names:
+            values = calculated.get(name, inputs.get(name))
+            if values is None:
+                raise KeyError(f"factor history value is unavailable: {name!r}")
+            matrices[name] = values.reindex(requested_sessions).to_numpy()
+        return self._history_frame(asset_list, names, requested_sessions, matrices)
+
+    def history(
+        self,
+        assets: Sequence[Asset],
+        fields: Sequence[str],
+        end_session: str | pd.Timestamp,
+        bar_count: int,
+        *,
+        adjusted: bool = True,
+    ) -> pd.DataFrame:
+        """Return callback-visible raw fields or factor expressions."""
+
+        field_list = list(fields)
+        if not any(is_factor_expression(field) for field in field_list):
+            return self._daily_history(
+                assets,
+                field_list,
+                end_session,
+                bar_count,
+                adjusted=adjusted,
+            )
+        sessions = self.calendar.window(end_session, bar_count, include_end=True)
+        return self.factor_history(
+            assets,
+            field_list,
+            sessions[0],
+            sessions[-1],
+            adjusted=adjusted,
+            allow_future=False,
+        )
+
+    @staticmethod
+    def available_operators() -> tuple[str, ...]:
+        """Return factor operators accepted by :meth:`history`."""
+
+        return available_operators()
 
     @lru_cache(maxsize=131_072)  # noqa: B019
     def raw_bar(self, asset: Asset, session: str | pd.Timestamp):

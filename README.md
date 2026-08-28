@@ -23,6 +23,7 @@
 - **真实市场时序**：D 日读取截至当日的数据并决策，订单最早 D+1 成交；内置 T+1、停牌、涨跌停、交易单位和现金约束。
 - **Point-in-time 数据**：财务数据按公告日期可见，指数成分使用严格早于当前回调日的最新权重快照，避免未来函数。
 - **高效本地数据层**：日频数据按年分区，DuckDB 执行投影和过滤下推；DataPortal 对一次性批量查询只扫描所需日期窗口，对重复固定资产池使用列缓存和自动复权依赖预取。
+- **向量化因子研究**：`$field` 表达式覆盖 `算子.md` 全部算子，支持 PIT 指数资产池、IC/RankIC、分位收益、单一 CSV 与交互式因子报告。
 - **原子增量更新**：只重写受影响年度分区，复用未变化文件，并通过 staging、generation、文件锁和 rollback 原子发布。
 - **完整数据质量报告**：覆盖 schema、主键、分区、日期、OHLC、复权、财务 PIT、指数权重和跨表引用，输出 HTML、JSON 与 CSV。
 - **可解释回测结果**：生成中文 Plotly HTML 报告、每日持仓、订单、成交、已平仓交易、组合归因和用户自定义记录。
@@ -104,6 +105,37 @@ outputs/ma20_etf/
 ```
 
 策略可通过 `result.orders`、`result.transactions`、`result.closed_trades`、`result.records` 和 `result.performance` 继续分析结构化结果。
+
+## 因子计算与分析
+
+离线因子数据可直接用 `data.history([...])` 获取：
+
+```python
+from tualpha import factor_data, run_factor_analysis
+
+with factor_data(
+    start="2017-01-01",
+    end="2026-01-01",
+    index_code="000852.SH",
+    exclude_st=True,
+    min_listed_days=365,
+    exclude_suspended=True,
+) as data:
+    factors = data.history(["RANK($close/$open)", "1/$daily_basic.total_mv"])
+
+result = run_factor_analysis(
+    {"日内强度": "RANK($close/$open)"},
+    start="2017-01-01",
+    end="2026-01-01",
+    index_code="000852.SH",
+    periods=[1, 5, 10],
+    industry_neutral=True,
+    market_cap_neutral=True,
+    output_dir="outputs/csi1000_intraday_strength",
+)
+```
+
+每份报告只分析一个因子，并明确展示原始因子公式。`periods` 接受正整数数组，传入的每个预测周期都会出现在汇总指标、因子加权多空累计收益、分位组合累计收益、IC/RankIC 及其他周期分析中。`industry_neutral` 使用当日 PIT 申万一级行业固定效应，`market_cap_neutral` 使用当日 `log(daily_basic.total_mv)`；两者默认关闭，联合开启时采用一次联合残差化。分析输出 `daily_factor_metrics.csv` 和 `factor_report.html`；HTML 覆盖 Alphalens 样本中的收益、IC、分位、换手、稳定性、月度热力图和行业分析。多个因子应分别调用并使用独立输出目录。详细说明见[因子研究文档](docs/factor-research.md)。
 
 ## 策略语义
 

@@ -51,6 +51,18 @@ closes = data.history(etf, "close", 20)
 panel = data.history([stock, etf], ["close", "volume"], 60)
 ```
 
+历史字段也可以是因子表达式，截面算子按当日资产列表计算，时序算子会自动扩展 warm-up 窗口：
+
+```python
+factors = data.history(
+    context.assets,
+    ["RANK($close/$open)", "TS_ZSCORE($volume,20)"],
+    60,
+)
+```
+
+回调表达式只能读取截至 D 日的数据。`FUTURE_RETURNS` 仅供离线因子分析生成标签，不能用于策略信号。完整用法见[因子研究](factor-research.md)。
+
 大型固定资产池必须使用批量接口。一次性 `current()` / `history()` 查询会自动只扫描当前日期或请求窗口；如果同一资产池和字段会在大量回调中重复使用，则在首次回调预热：
 
 ```python

@@ -15,6 +15,7 @@ htmlcov/
 site/
 .pytest_cache/
 .ruff_cache/
+.tmp/
 
 # Local backtest outputs
 outputs/

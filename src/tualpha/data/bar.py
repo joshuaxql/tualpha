@@ -263,5 +263,10 @@ class BarData:
     def available_fields(self, namespace: str | None = None) -> tuple[str, ...]:
         return self._portal.available_fields(namespace)
 
+    def available_operators(self) -> tuple[str, ...]:
+        """Return factor operators accepted by :meth:`history`."""
+
+        return self._portal.available_operators()
+
     def can_trade(self, asset: Asset) -> bool:
         return self._portal.is_tradable(asset, self.current_session)
